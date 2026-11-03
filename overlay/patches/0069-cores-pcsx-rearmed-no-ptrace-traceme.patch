@@ -1,0 +1,15 @@
+diff --git a/cores/pcsx-rearmed/frontend/libretro.c b/cores/pcsx-rearmed/frontend/libretro.c
+--- a/cores/pcsx-rearmed/frontend/libretro.c
++++ b/cores/pcsx-rearmed/frontend/libretro.c
+@@ -3919,8 +3919,10 @@
+    msg_interface_version = 0;
+    environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &msg_interface_version);
+ 
+-#if defined(__MACH__) && !defined(TVOS)
++#if defined(__MACH__) && !defined(TVOS) && !defined(DRC_DISABLE)
+    // magic sauce to make the dynarec work on iOS
++   // (0069: skipped in interpreter-only builds - PT_TRACE_ME there buys no JIT
++   // and leaves the whole host app self-traced, so signals stop it, not end it)
+    syscall(SYS_ptrace, 0 /*PTRACE_TRACEME*/, 0, 0, 0);
+ #endif
+ 

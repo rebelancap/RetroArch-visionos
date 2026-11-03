@@ -1,0 +1,36 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_ContextImpl.cpp b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_ContextImpl.cpp
+--- a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_ContextImpl.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_ContextImpl.cpp
+@@ -188,11 +188,21 @@
+-	} else {
+-#if defined(OS_ANDROID)
+-		// Using the GLES3 paths causes some background garbage where the Overscan is
+-		// TODO: Investigate this
+-		m_cachedFunctions->getCachedClearColor()->setClearColor(_red, _green, _blue, _alpha);
+-		glClear(GL_COLOR_BUFFER_BIT);
+-#else
+-		GLfloat values[4] = {_red, _green, _blue, _alpha};
+-		glClearBufferfv(GL_COLOR, 0, values);
+-#endif // OS_ANDROID
+-	}
++	} else if (m_glInfo.renderer == Renderer::Angle) {
++		/* 0041: upstream's own comment on the GLES3 clear path is "causes some
++		 * background garbage where the Overscan is" — which is precisely the
++		 * rainbow noise in the letterbox bars on visionOS. Upstream gated the
++		 * glClear fallback to OS_ANDROID because Android was the only ANGLE
++		 * target they tested; we drive ANGLE (GLES3-over-Metal) as well, so take
++		 * the same fallback wherever the renderer IS ANGLE. Mirrors overlay 0026.
++		 */
++		m_cachedFunctions->getCachedClearColor()->setClearColor(_red, _green, _blue, _alpha);
++		glClear(GL_COLOR_BUFFER_BIT);
++	} else {
++#if defined(OS_ANDROID)
++		// Using the GLES3 paths causes some background garbage where the Overscan is
++		// TODO: Investigate this
++		m_cachedFunctions->getCachedClearColor()->setClearColor(_red, _green, _blue, _alpha);
++		glClear(GL_COLOR_BUFFER_BIT);
++#else
++		GLfloat values[4] = {_red, _green, _blue, _alpha};
++		glClearBufferfv(GL_COLOR, 0, values);
++#endif // OS_ANDROID
++	}

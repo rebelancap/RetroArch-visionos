@@ -1,0 +1,62 @@
+diff --git a/ui/drivers/ui_cocoatouch.m b/ui/drivers/ui_cocoatouch.m
+--- a/ui/drivers/ui_cocoatouch.m
++++ b/ui/drivers/ui_cocoatouch.m
+@@ -1253,6 +1253,17 @@
+    [self showGameView];
+ 
+    rarch_main(argc, argv, NULL);
++
++#if TARGET_OS_VISION
++   /* 0034: the frontend is now up, so CocoaView's display link may start
++    * iterating. Until this point a tick would run runloop_iterate() against an
++    * uninitialised frontend and segfault (SIGSEGV in -[CocoaView step:] at
++    * launch, through). Defined in cocoa_common.m. */
++   {
++      extern void ra_vision_mark_frontend_ready(void);
++      ra_vision_mark_frontend_ready();
++   }
++#endif
+ 
+ #ifdef HAVE_KSCRASH
+    [self processKSCrashReports];
+@@ -1583,6 +1594,40 @@
+    return true;
+ }
+ 
++#if defined(RA_VISION_3D)
++/* --- 0034: launch instrumentation + always-armed crash logging ---------------
++ *
++ * Device evidence (beacons): dead launches show "process spawned" and
++ * the display-link pace announce, then NOTHING — no applicationDidFinishLaunching
++ * line at all, even on the launches that succeeded. Under the SwiftUI
++ * @UIApplicationDelegateAdaptor the old-style -applicationDidFinishLaunching:
++ * selector is not what UIKit invokes, so:
++ *
++ *  1. Implement the modern -application:didFinishLaunchingWithOptions:. It just
++ *     beacons and forwards to the existing body, so nothing about the launch
++ *     sequence changes except that we can see it happen.
++ *  2. Arm the crash handlers from +load. They used to be installed only from
++ *     the two didFinishLaunching bodies, which is exactly why a launch that
++ *     dies before (or instead of) that point left no crash.txt at all. +load
++ *     runs while the image is being loaded, with Foundation already up, so
++ *     every process is covered however it dies. The didFinishLaunching call
++ *     stays; ra_install_crash_handlers just re-registers the same handlers, so
++ *     calling it twice is a no-op. */
+++ (void)load
++{
++   ra_install_crash_handlers();
++   RA_BeaconMark("beacon: RetroArch_iOS +load (crash handlers armed)");
++}
++
++- (BOOL)application:(UIApplication *)application
++        didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
++{
++   RA_BeaconMark("application:didFinishLaunchingWithOptions:");
++   [self applicationDidFinishLaunching:application];
++   return YES;
++}
++#endif
++
+ - (void)navigationController:(UINavigationController *)navigationController willShowViewController:(UIViewController *)viewController animated:(BOOL)animated
+ {
+ #if TARGET_OS_IOS

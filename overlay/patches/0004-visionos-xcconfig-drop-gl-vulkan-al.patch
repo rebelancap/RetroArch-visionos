@@ -1,0 +1,50 @@
+diff --git a/pkg/apple/BaseConfig.xcconfig b/pkg/apple/BaseConfig.xcconfig
+--- a/pkg/apple/BaseConfig.xcconfig
++++ b/pkg/apple/BaseConfig.xcconfig
+@@ -150,6 +150,34 @@
+ OTHER_CFLAGS[sdk=iphoneos*] = $(inherited) $(OTHER_CFLAGS_IOS)
+ OTHER_CFLAGS[sdk=iphonesimulator*] = $(inherited) $(OTHER_CFLAGS_IOS)
+ 
++// visionOS (xrOS): treat as an iOS-like mobile Apple target, MINUS all OpenGL.
++// visionOS has no OpenGL ES / EAGL / GLKit and no desktop GL, so drop every GL
++// flavour (the trailing -U undoes the -DHAVE_OPENGLES from SHARE and the
++// unconditional -DHAVE_OPENGL) — griffin then omits the GL drivers entirely and
++// the Metal driver is used. RA_VISIONOS marks visionOS-specific code..
++// HAVE_VULKAN is KEPT (over MoltenVK 1.4.1 xros slice) for ParaLLEl-RDP / flycast
++// GPU rendering; the griffin.c:288 RA_VISIONOS gate keeps GL out of the Vulkan
++// include (overlay 0020). HAVE_GLSL stays off (GL-only).
++// NO_DLCLOSE was set here in to stop pthread-key index recycling from
++// killing ANGLE's per-thread key. fixed that at the root — ANGLE
++// is now built with real thread_local instead of pthread keys
++// (scripts/angle-static-tls-patch.py) — so the workaround is gone again: cores
++// dlclose normally, core switching needs no relaunch, and core-option changes
++// are no longer cached in stale core statics across a content reload.
++OTHER_CFLAGS[sdk=xros*] = $(inherited) $(OTHER_CFLAGS_IOS_TVOS_SHARE) $(OTHER_CFLAGS_IOS) -DRA_VISIONOS -DRA_VISION_3D -DHAVE_ANGLE -DHAVE_EGL -I$(SRCROOT)/Frameworks/angle-xros/include -UHAVE_AL -UHAVE_CORELOCATION -UHAVE_COREMOTION -UHAVE_AVF -UHAVE_CAMERA
++OTHER_LDFLAGS[sdk=xros*] = $(inherited) -L$(SRCROOT)/Frameworks/angle-xros -lEGLGLES_shim
++OTHER_CFLAGS[sdk=xrsimulator*] = $(inherited) $(OTHER_CFLAGS_IOS_TVOS_SHARE) $(OTHER_CFLAGS_IOS) $(OTHER_CFLAGS_SIMULATORS) -DRA_VISIONOS -DRA_VISION_3D -DHAVE_ANGLE -DHAVE_EGL -I$(SRCROOT)/Frameworks/angle-xros-sim/include -UHAVE_AL -UHAVE_CORELOCATION -UHAVE_COREMOTION -UHAVE_AVF -UHAVE_CAMERA
++// The simulator needs the VISIONOSSIMULATOR ANGLE slice; pointing this at the
++// device dir made every xrsimulator link fail (ld: built for 'visionOS').
++OTHER_LDFLAGS[sdk=xrsimulator*] = $(inherited) -L$(SRCROOT)/Frameworks/angle-xros-sim -lEGLGLES_shim
++
++// The Swift clang-importer does NOT see OTHER_CFLAGS, so the bridging header
++// would compile RAVision.h with RA_VISION_3D undefined (i.e. empty) and every
++// 3D symbol would be invisible to RAVisionApp.swift.  Hand the define to the
++// importer explicitly.
++OTHER_SWIFT_FLAGS[sdk=xros*] = $(inherited) -Xcc -DRA_VISION_3D
++OTHER_SWIFT_FLAGS[sdk=xrsimulator*] = $(inherited) -Xcc -DRA_VISION_3D
++
+ OTHER_CFLAGS[config=Debug] = $(inherited) -DDEBUG=1
+ OTHER_CFLAGS[config=Release] = $(inherited) -DNDEBUG -DNS_BLOCK_ASSERTIONS=1
+ 
+@@ -177,6 +211,11 @@
+ HEADER_SEARCH_PATHS = $(inherited) $(SRCBASE)
+ HEADER_SEARCH_PATHS = $(inherited) $(SRCBASE)/gfx/include
+ HEADER_SEARCH_PATHS = $(inherited) $(SRCBASE)/libretro-common/include
++// visionOS 3D theater shell: app/visionos/ lives OUTSIDE the vendored
++// RetroArch tree (overlay discipline - new shell code is additive, not a
++// patch), so its headers need an explicit search path.  SRCBASE is
++// vendor/RetroArch, so ../.. from it is the port repo root.
++HEADER_SEARCH_PATHS = $(inherited) $(SRCBASE)/../../app/visionos
+ 
+ CLANG_CXX_LANGUAGE_STANDARD=c++11
+ CLANG_ENABLE_OBJC_ARC=YES

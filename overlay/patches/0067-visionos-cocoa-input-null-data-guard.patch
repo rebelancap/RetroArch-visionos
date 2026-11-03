@@ -1,0 +1,26 @@
+diff --git a/input/drivers/cocoa_input.m b/input/drivers/cocoa_input.m
+--- a/input/drivers/cocoa_input.m
++++ b/input/drivers/cocoa_input.m
+@@ -576,9 +576,19 @@
+       unsigned idx,
+       unsigned id)
+ {
+-   cocoa_input_data_t *apple = (cocoa_input_data_t*)data;
+-
+-   switch (device)
++   cocoa_input_data_t *apple = (cocoa_input_data_t*)data;
++
++   /* 0067: the input driver is DOWN (input_st->current_data == NULL) for the
++    * whole window of a content swap, and stays down if a content load aborts.
++    * visionOS drives the run loop from a CADisplayLink (overlay 0033), so
++    * runloop_check_state() -> menu_event() -> this function keeps being called
++    * inside that window and dereferences NULL.  Same fault class as 0066's
++    * core_run() guard; "nothing pressed" is the right answer for "no input
++    * driver right now". */
++   if (!apple)
++      return 0;
++
++   switch (device)
+    {
+       case RETRO_DEVICE_JOYPAD:
+          if (id == RETRO_DEVICE_ID_JOYPAD_MASK)

@@ -1,0 +1,13 @@
+diff --git a/ui/drivers/cocoa/apple_platform.h b/ui/drivers/cocoa/apple_platform.h
+index cbbc025..2dfb1fc 100644
+--- a/ui/drivers/cocoa/apple_platform.h
++++ b/ui/drivers/cocoa/apple_platform.h
+@@ -10,7 +10,7 @@ extern void write_userdefaults_config_file(void);
+ extern void update_topshelf(void);
+ #endif
+ 
+-#if TARGET_OS_IOS
++#if TARGET_OS_IOS || TARGET_OS_VISION
+ extern void ios_show_file_sheet(void);
+ extern bool ios_running_on_ipad(void);
+ #endif

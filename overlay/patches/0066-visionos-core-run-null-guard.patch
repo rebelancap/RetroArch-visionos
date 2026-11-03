@@ -1,0 +1,37 @@
+diff --git a/runloop.c b/runloop.c
+--- a/runloop.c
++++ b/runloop.c
+@@ -8459,11 +8459,28 @@
+    runloop_st->current_core.retro_reset();
+ }
+ 
+-void core_run(void)
+-{
+-   runloop_state_t *runloop_st = &runloop_state;
+-   struct retro_core_t *
+-      current_core             = &runloop_st->current_core;
++void core_run(void)
++{
++   runloop_state_t *runloop_st = &runloop_state;
++   struct retro_core_t *
++      current_core             = &runloop_st->current_core;
++
++   /* 0066: no core loaded -> retro_run is NULL, and calling it is a jump to
++    * address 0.  Cannot happen where one loop owns both iteration and content
++    * load/unload; on visionOS a CADisplayLink drives the run loop (overlay
++    * 0033) and keeps firing while the main thread is inside a load or an
++    * unload, so it re-enters here mid-swap.  Skipping the frame is exactly
++    * what "no core right now" should do. */
++   if (!current_core->retro_run)
++   {
++      static bool ra_warned_null_retro_run = false;
++      if (!ra_warned_null_retro_run)
++      {
++         ra_warned_null_retro_run = true;
++         RARCH_ERR("[Core]: core_run() with no retro_run - frame skipped.\n");
++      }
++      return;
++   }
+    const enum poll_type_override_t
+       core_poll_type_override  = runloop_st->core_poll_type_override;
+    enum poll_type new_poll_type= (core_poll_type_override != POLL_TYPE_OVERRIDE_DONTCARE)

@@ -1,0 +1,14 @@
+diff --git a/pkg/apple/RetroArch-Bridging-Header.h b/pkg/apple/RetroArch-Bridging-Header.h
+index ef999fe..b955bf1 100644
+--- a/pkg/apple/RetroArch-Bridging-Header.h
++++ b/pkg/apple/RetroArch-Bridging-Header.h
+@@ -14,3 +14,9 @@
+ #import "../ui/drivers/cocoa/cocoa_common.h"
+ #import "../../ui/drivers/cocoa/RetroArchPlaylistManager.h"
+ #import "../ui/drivers/cocoa/apple_platform.h"
++
++/* visionOS 3D theater shell (app/visionos/, on the header search path).  The
++ * header is empty unless RA_VISION_3D is defined, so iOS/tvOS see nothing.
++ * This is what makes RA_MakeHostViewController / RA_Immersive_Run / the panel
++ * setters visible to RAVisionApp.swift. */
++#import "RAVision.h"

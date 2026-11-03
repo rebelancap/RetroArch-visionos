@@ -1,0 +1,31 @@
+diff --git a/cores/bsnes-hd-beta/bsnes/target-libretro/libretro_core_options.h b/cores/bsnes-hd-beta/bsnes/target-libretro/libretro_core_options.h
+--- a/cores/bsnes-hd-beta/bsnes/target-libretro/libretro_core_options.h
++++ b/cores/bsnes-hd-beta/bsnes/target-libretro/libretro_core_options.h
+@@ -613,11 +613,22 @@
+       {
+          { "Mode 7", "Only for Mode 7 scenes" },
+          { "all",    "Enable for all scenes"  },
+-         { "none",   "disabled"               },
+-         { NULL, NULL },
+-      },
+-      "Mode 7"
+-   },
++         { "none",   "disabled"               },
++         { NULL, NULL },
++      },
++      /* 0053: this port's visionOS slice widens EVERY scene, not only Mode 7 —
++       * "widescreen SNES" is what was asked for, and Mode-7-only leaves the
++       * great majority of the library at 4:3. Upstream's default is kept for
++       * every other platform. The flanking defaults that keep "all" clean
++       * (wsobj=safe, igwin=outside, wsbg*=auto horz and vert, wsMarker=none)
++       * are DerKoun's own and are deliberately untouched. Per-game quality
++       * varies: */
++#if defined(BSNES_XROS_WIDESCREEN)
++      "all"
++#else
++      "Mode 7"
++#endif
++   },
+    {
+       "bsnes_mode7_widescreen",
+       "Widescreen - Aspect Ratio",

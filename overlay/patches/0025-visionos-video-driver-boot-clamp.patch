@@ -1,0 +1,25 @@
+diff --git a/configuration.c b/configuration.c
+index a748f32..d1be4e3 100644
+--- a/configuration.c
++++ b/configuration.c
+@@ -7054,6 +7054,20 @@ static bool config_load_file(global_t *global,
+    if (size_settings)
+       free(size_settings);
+    first_load = false;
++#ifdef RA_VISIONOS
++   /* Boot clamp: Metal is the home video driver on
++    * visionOS; gl (ANGLE) / vulkan exist only as per-content HW-context switches
++    * (video_driver_find_driver, run at content init AFTER this). A switch saved
++    * mid-content or left by a crash must NOT become the launch driver, or every
++    * menu renders through the GL/Vulkan path (oversized) — and it survives
++    * reinstall-over. Force metal here; self-heals an already-poisoned config. */
++   if (!string_is_equal(settings->arrays.video_driver, "metal"))
++   {
++      RARCH_WARN("[visionOS] Overriding persisted video driver \"%s\" -> metal.\n",
++            settings->arrays.video_driver);
++      configuration_set_string(settings, settings->arrays.video_driver, "metal");
++   }
++#endif
+    return true;
+ }
+ 

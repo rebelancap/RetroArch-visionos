@@ -1,0 +1,22 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/GraphicsDrawer.cpp b/cores/mupen64plus-next/GLideN64/src/GraphicsDrawer.cpp
+--- a/cores/mupen64plus-next/GLideN64/src/GraphicsDrawer.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/GraphicsDrawer.cpp
+@@ -167,6 +167,18 @@
+ bool _needAdjustCoordinate(DisplayWindow & _wnd)
+ {
+ 	return _wnd.isAdjustScreen() &&
++		/* 0050: the heuristic below asks "is the game drawing into a
++		 * sub-viewport?" out of gSP.viewport, which is HLE state filled in by
++		 * gSPViewport() while GLideN64 walks the display list. With an LLE RSP
++		 * (cxd4) the ucode runs in the RSP plugin, gSPViewport() is never
++		 * called, and gSP.viewport.width stays 0.0 for the whole session — so
++		 * "0 < colorImage.width" fires on every draw and _adjustScissorX()
++		 * crops the picture to the centre 75%. That is the visionOS boxed
++		 * frame, to the pixel. Zero is not a narrow viewport, it is an
++		 * unknown viewport: require a real one before adjusting anything.
++		 * No-op under HLE, where this reads 320 against a 320-wide colour
++		 * image. */
++		gSP.viewport.width > 0.0f &&
+ 		gSP.viewport.width < gDP.colorImage.width &&
+ 		u32(gSP.viewport.width + gSP.viewport.x * 2.0f) != gDP.colorImage.width &&
+ 		gDP.colorImage.width > VI.width * 98 / 100;

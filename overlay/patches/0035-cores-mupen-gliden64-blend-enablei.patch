@@ -1,0 +1,24 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp
+index 8f9813c..7a1f313 100644
+--- a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp
+@@ -171,6 +171,19 @@ void GLInfo::init() {
+ 		ptrProgramParameteri = nullptr;
+ 	}
+ #endif
++
++	// Indexed blend enables (glEnablei/glDisablei) are core only in GLES 3.2 and
++	// otherwise need GL_EXT_draw_buffers_indexed. The guard above lives inside
++	// #ifdef EGL, which the libretro build does not define, so under libretro the
++	// pointers keep whatever the frontend's get_proc_address returned. Apple's
++	// native GLES3 has no glEnablei to hand out (NULL -> the glEnable fallback is
++	// taken), but ANGLE hands back a valid entry point for an ES 3.0 context, where
++	// the call does nothing: GL_BLEND is then NEVER enabled and every alpha-blended
++	// draw becomes an opaque box. Re-apply the guard unconditionally.
++	if (isGLESX && numericVersion < 32 && !ext_draw_buffers_indexed) {
++		ptrEnablei = nullptr;
++		ptrDisablei = nullptr;
++	}
+ #ifndef OS_ANDROID
+ 	if (isGLES2 && config.frameBufferEmulation.copyToRDRAM > Config::ctSync) {
+ 		config.frameBufferEmulation.copyToRDRAM = Config::ctDisable;

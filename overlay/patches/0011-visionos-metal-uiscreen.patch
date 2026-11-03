@@ -1,0 +1,212 @@
+diff --git a/gfx/drivers/metal.m b/gfx/drivers/metal.m
+index 88139ec..2b32ab4 100644
+--- a/gfx/drivers/metal.m
++++ b/gfx/drivers/metal.m
+@@ -65,6 +65,14 @@
+ #define PLATFORM_METAL_RESOURCE_STORAGE_MODE MTLResourceStorageModeManaged
+ #endif
+ 
++#if defined(RA_VISION_3D)
++/* visionOS 3D theater mode: while the immersive space is open the frame is
++ * rendered into an app-owned texture instead of the window's swapchain, and a
++ * CompositorServices loop draws it on a world-locked panel.  Everything below
++ * the drawable is untouched — see app/visionos/RAVision.h. */
++#include "RAVision.h"
++#endif
++
+ /*! @brief maximum inflight frames for triple buffering */
+ #define MAX_INFLIGHT 3
+ #define CHAIN_LENGTH 3
+@@ -584,12 +592,14 @@ static bool metal_display_supports_edr(void)
+    if (@available(tvOS 16.0, *))
+       return true;
+ #else
++#if !TARGET_OS_VISION
+    if (@available(iOS 16.0, *))
+    {
+       UIScreen *screen = [UIScreen mainScreen];
+       if (screen)
+          return screen.potentialEDRHeadroom > 1.0;
+    }
++#endif /* visionOS: no UIScreen EDR query */
+ #endif
+ #endif
+    return false;
+@@ -707,6 +717,12 @@ @implementation Context
+    id<MTLCommandQueue> _commandQueue;
+    CAMetalLayer *_layer;
+    id<CAMetalDrawable> _drawable;
++#if defined(RA_VISION_3D)
++   /* Ring slot backing _drawable while 3D theater mode is active, or -1 when
++    * the drawable came from the window's CAMetalLayer as usual.  Published by
++    * value from the frame's completion handler (see -end). */
++   int _offscreenSlot;
++#endif
+    video_viewport_t _viewport;
+    id<MTLSamplerState> _samplers[TEXTURE_FILTER_MIPMAP_NEAREST + 1];
+    Filter *_filters[RPixelFormatCount]; /* convert to BGRA8888 */
+@@ -1920,7 +1936,27 @@ - (Texture *)newTextureCompressed:(const struct texture_compressed *)tc
+ - (id<CAMetalDrawable>)nextDrawable
+ {
+    if (_drawable == nil)
++   {
++#if defined(RA_VISION_3D)
++      /* 3D theater: hand back an offscreen stand-in.  This has to be the
++       * redirect point rather than a copy-out afterwards, because a window
++       * parked behind an open ImmersiveSpace stops vending drawables and this
++       * call BLOCKS for frame pacing — the emulator would hang the moment the
++       * space opened. */
++      if (ra_vision_3d_active())
++      {
++         int   slot = -1;
++         void *d    = ra_vision_offscreen_acquire((__bridge void *)_device,
++                                                  (unsigned)_layer.pixelFormat,
++                                                  &slot);
++         _offscreenSlot = slot;
++         _drawable      = (__bridge id<CAMetalDrawable>)d;
++         return _drawable;
++      }
++      _offscreenSlot = -1;
++#endif
+       _drawable = _layer.nextDrawable;
++   }
+    return _drawable;
+ }
+ 
+@@ -2259,6 +2295,19 @@ - (void)end
+ 
+    id<CAMetalDrawable> drawable = self.nextDrawable;
+ 
++#if defined(RA_VISION_3D)
++   if (ra_vision_3d_active() && _offscreenSlot >= 0)
++   {
++      /* Publish from the COMPLETED handler, not the scheduled one: the panel
++       * must only ever sample a texture the GPU has finished writing. */
++      const int slot = _offscreenSlot;
++      [_commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull buffer) {
++         (void)buffer;
++         ra_vision_offscreen_publish(slot);
++      }];
++   }
++   else
++#endif
+    if (drawable)
+    {
+       /* Use addScheduledHandler to present, following Apple's recommendation.
+@@ -2288,6 +2337,16 @@ - (void)swapBuffers
+     * in-flight), which naturally paces us to the display refresh rate.
+     * This blocking behavior is intentional for proper frame pacing. */
+    _drawable = nil;
++#if defined(RA_VISION_3D)
++   /* Offscreen: nothing to pre-acquire, and re-acquiring here would burn a
++    * second ring slot per frame.  -rce / -end acquire lazily, and pacing comes
++    * from the compositor's per-frame credit instead of a blocking swapchain. */
++   if (ra_vision_3d_active())
++   {
++      _offscreenSlot = -1;
++      return;
++   }
++#endif
+    _drawable = _layer.nextDrawable;
+ }
+ 
+@@ -3127,7 +3186,25 @@ - (instancetype)initWithDriver:(MetalDriver *)driver fontPath:(const char *)font
+                                                                                    height:_atlas->height
+                                                                                 mipmapped:NO];
+ 
++#if TARGET_OS_SIMULATOR
++      /* A linear (buffer-backed) texture must use MTLStorageModePrivate in the
++       * simulator, and this atlas has to stay CPU-writable — so the simulator
++       * gets an independent texture that we upload into instead of a view onto
++       * the buffer.  The buffer stays as the staging copy so -updateGlyph's
++       * incremental writes are unchanged.
++       *
++       * This is what made the font driver assert the instant any UI drew, which
++       * is why every earlier attempt at simulator validation on this port died
++       * on the render path.  Device behaviour is byte-identical: the
++       * whole branch is compiled out. */
++      _texture  = [_context.device newTextureWithDescriptor:td];
++      [_texture replaceRegion:MTLRegionMake2D(0, 0, _atlas->width, _atlas->height)
++                  mipmapLevel:0
++                    withBytes:_buffer.contents
++                  bytesPerRow:_stride];
++#else
+       _texture  = [_buffer newTextureWithDescriptor:td offset:0 bytesPerRow:_stride];
++#endif
+ 
+       if (![self _initializeState])
+          return nil;
+@@ -3214,6 +3291,22 @@ - (void)updateGlyph:(const struct font_glyph *)glyph
+       [_buffer didModifyRange:NSMakeRange(offset, len)];
+ #endif
+ 
++#if TARGET_OS_SIMULATOR
++      /* The simulator's atlas texture is independent of the buffer (see
++       * -initWithDriver:), so the touched rows have to be pushed across. */
++      {
++         NSUInteger y0 = (NSUInteger)glyph->atlas_offset_y;
++         NSUInteger rows = (NSUInteger)glyph->height;
++         if (y0 + rows > _atlas->height)
++            rows = (_atlas->height > y0) ? (_atlas->height - y0) : 0;
++         if (rows > 0)
++            [_texture replaceRegion:MTLRegionMake2D(0, y0, _atlas->width, rows)
++                        mipmapLevel:0
++                          withBytes:(const uint8_t *)_buffer.contents + y0 * _stride
++                        bytesPerRow:_stride];
++      }
++#endif
++
+       _atlas->dirty = false;
+    }
+ }
+@@ -3616,6 +3709,21 @@ @implementation MetalView
+ - (void)keyDown:(NSEvent*)theEvent { }
+ #endif
+ 
++#if TARGET_OS_VISION
++/* 0021: the render view's OWN layoutSubviews is the can't-miss signal for a bounds
++ * change on visionOS — VC layout callbacks (viewWill/DidLayoutSubviews) are not
++ * reliably delivered AFTER the async requestGeometryUpdate resize settles, so the
++ * drawable never tracked the new window (beacon-confirmed). UIKit runs a view's
++ * layoutSubviews on the next CA commit whenever its frame/bounds change. Re-derive
++ * the drawable here (skip-if-unchanged guarded). */
++- (void)layoutSubviews
++{
++   [super layoutSubviews];
++   extern void cocoa_vision_update_drawable(void);
++   cocoa_vision_update_drawable();
++}
++#endif
++
+ /* Stop the annoying sound when pressing a key. */
+ - (BOOL)acceptsFirstResponder { return YES; }
+ - (BOOL)isFlipped { return YES; }
+@@ -4303,8 +4411,28 @@ - (Uniforms *)viewportMVP { return &_viewportMVP; }
+ - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size
+ {
+ #ifdef HAVE_COCOATOUCH
++#if TARGET_OS_VISION
++    /* visionOS: the drawable size is set directly (autoResizeDrawable=NO), so use
++     * the real drawable, not bounds x contentScaleFactor (contentScaleFactor is
++     * capped by the system and would under-size the viewport). */
++    CGSize d = view.drawableSize;
++    if (d.width < 1.0 || d.height < 1.0) d = size;
++    [self setViewportWidth:(unsigned int)d.width height:(unsigned int)d.height forceFull:NO allowRotate:YES];
++    /* 0019 verification beacon: fires only on a real drawable change (the
++     * update_drawable change-guard gates it). Confirms drawable->viewport with
++     * no side bars once the drawable tracks the window aspect. */
++    {
++       extern void RA_BeaconMark(const char *);
++       char _m[128];
++       snprintf(_m, sizeof _m, "drawable %.0fx%.0f -> vp %ux%u @%d,%d (full %ux%u)",
++                d.width, d.height, _viewport->width, _viewport->height,
++                _viewport->x, _viewport->y, _viewport->full_width, _viewport->full_height);
++       RA_BeaconMark(_m);
++    }
++#else
+     CGFloat scale = [[UIScreen mainScreen] scale];
+     [self setViewportWidth:(unsigned int)view.bounds.size.width*scale height:(unsigned int)view.bounds.size.height*scale forceFull:NO allowRotate:YES];
++#endif
+ #else
+    [self setViewportWidth:(unsigned int)size.width height:(unsigned int)size.height forceFull:NO allowRotate:YES];
+ #endif

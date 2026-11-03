@@ -1,0 +1,56 @@
+diff --git a/cores/mupen64plus-next/libretro/libretro.c b/cores/mupen64plus-next/libretro/libretro.c
+--- a/cores/mupen64plus-next/libretro/libretro.c
++++ b/cores/mupen64plus-next/libretro/libretro.c
+@@ -1022,6 +1022,32 @@
+        {
+           EnableThreadedRenderer = !strcmp(var.value, "True") ? 1 : 0;
+        }
++
++#if defined(MUPEN_VK_DEFAULT)
++       /* 0043 (visionOS only) — the threaded-renderer force, one compile flag.
++        *
++        * GLideN64's ThreadedOpenGl layer (FunctionWrapper) replays every GL call
++        * from a second thread. It defaulted to True on this slice (overlay 0016,
++        * a macOS-harness perf win) and FORCED it off: it had never been
++        * exercised against ANGLE on device, and / pthread-key TLS
++        * disease is precisely a *worker thread* losing its ANGLE per-thread
++        * state. Forced rather than defaulted because the value is persisted in
++        * the per-core options file on the tester's device, so a changed default is
++        * inert there.
++        *
++        * tries it ON: the static-TLS work closed that crash
++        * family, and measured retro_run 3.219 -> 1.970 ms (-39 %) at
++        * The tester's exact settings. The value is now whatever
++        * MUPEN_FORCE_THREADED_RENDERER says, so reverting the experiment is a
++        * single character in scripts/build-core-xros.sh; with the flag absent or
++        * 0 this is byte-for-byte the .16-.23 behaviour. The `gliden64 wnd:`
++        * beacon reports the effective value. */
++#if defined(MUPEN_FORCE_THREADED_RENDERER)
++       EnableThreadedRenderer = (MUPEN_FORCE_THREADED_RENDERER);
++#else
++       EnableThreadedRenderer = 0;
++#endif
++#endif
+ 	    
+        if(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
+        {
+@@ -1494,6 +1520,19 @@
+        {
+           EnableOverscan = !strcmp(var.value, "Enabled") ? 1 : 0;
+        }
++
++#if defined(MUPEN_VK_DEFAULT)
++       /* 0043 (visionOS only): FORCE overscan cropping off. Introduced in
++        * as a diagnostic — with it on, GLideN64 presents through
++        * OverscanBuffer, whose offsets are captured once in _initData() while
++        * its scale is refreshed every frame. Kept as a FEATURE decision since
++        * overlay 0052's uniform window fill is written
++        * against the non-overscan destination rectangle and is the measured
++        * answer to the black-margin question, so overscan compositing must stay
++        * out of the path. Same persistence reasoning as ThreadedRenderer above:
++        * forced, not defaulted. The beacon reports the effective value. */
++       EnableOverscan = 0;
++#endif
+ 
+        var.key = CORE_NAME "-OverscanTop";
+        var.value = NULL;

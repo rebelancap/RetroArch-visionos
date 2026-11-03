@@ -1,0 +1,182 @@
+diff --git a/ui/drivers/cocoa/cocoa_common.m b/ui/drivers/cocoa/cocoa_common.m
+index 687a236..25e3dbd 100644
+--- a/ui/drivers/cocoa/cocoa_common.m
++++ b/ui/drivers/cocoa/cocoa_common.m
+@@ -27,6 +27,9 @@
+ 
+ #include "cocoa_common.h"
+ #include "apple_platform.h"
++#if TARGET_OS_VISION
++#import <GameController/GameController.h> /* GCEventInteraction — pad claim (guide 1.3) */
++#endif
+ #include "../ui_cocoa.h"
+ #ifdef HAVE_RETROARCH_PLAYLIST_MANAGER
+ #include "RetroArchPlaylistManager.h"
+@@ -144,6 +147,25 @@ static void rarch_draw_observer(CFRunLoopObserverRef observer,
+       return;
+    }
+ 
++#if TARGET_OS_VISION
++   /* 0021: per-frame drawable/swapchain reconcile on the main thread. The
++    * skip-if-unchanged guard makes this ~two float compares/frame until a resize
++    * actually drifts the window; then it converges within one frame regardless of
++    * which path resized it (our request, corner-drag, OS). This is the guarantee
++    * behind the MetalView layoutSubviews signal, and — via publish_size — is what
++    * makes RetroArch rebuild the Vulkan swapchain (N64) after a resize too.
++    * Main-thread, so UIKit reads are legal (unlike metal.m's video-worker loop).
++    * */
++   {
++      extern void cocoa_vision_update_drawable(void);
++      cocoa_vision_update_drawable();
++#ifdef HAVE_VULKAN
++      void cocoa_vk_gfx_ctx_publish_size(void);
++      cocoa_vk_gfx_ctx_publish_size();
++#endif
++   }
++#endif
++
+    task_queue_check();
+ 
+ #ifdef HAVE_MIST
+@@ -249,7 +271,14 @@ + (CocoaView*)get
+ #if defined(IOS)
+       view.displayLink = [CADisplayLink displayLinkWithTarget:view selector:@selector(step:)];
+       {
++#if TARGET_OS_VISION
++         /* Request the panel's max: M5 Vision Pro runs up to 120 Hz (a clean 2x
++          * of 60 fps retro content), M2 caps at 90. The system clamps the range
++          * to whatever the panel supports. */
++         float hz = 120.0f;
++#else
+          float hz = (float)[UIScreen mainScreen].maximumFramesPerSecond;
++#endif
+ #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 150000 || __TV_OS_VERSION_MAX_ALLOWED >= 150000
+          if (@available(iOS 15.0, tvOS 15.0, *))
+             [view.displayLink setPreferredFrameRateRange:
+@@ -716,6 +745,20 @@ - (void)viewWillLayoutSubviews
+ #endif
+ }
+ 
++#if TARGET_OS_VISION
++- (void)viewDidLayoutSubviews
++{
++   [super viewDidLayoutSubviews];
++   /* patch 0015 (0019 fix): re-derive the ~3840 drawable AFTER Auto Layout has
++    * resolved _renderView's constraints. Doing this in viewWillLayoutSubviews
++    * read PRE-resize bounds, so a window aspect change (e.g. content load 16:9->
++    * 4:3) left a stale 16:9 drawable that got compressed into the 4:3 window
++    * (side bars + squish). Post-layout bounds are the truth. */
++   void cocoa_vision_update_drawable(void);
++   cocoa_vision_update_drawable();
++}
++#endif
++
+ /* NOTE: This version runs on iOS6+. */
+ - (UIInterfaceOrientationMask)supportedInterfaceOrientations
+ {
+@@ -765,6 +808,17 @@ -(void)loadView {
+ 
+ -(void)viewDidLoad {
+     [super viewDidLoad];
++#if TARGET_OS_VISION
++    /* visionOS routes controller presses into its gaze-pinch UI layer by default
++     * and withholds them from GCController, so the emulator sees a dead pad while
++     * the pad drives the system pointer. Claim the gamepad app-wide so RetroArch's
++     * mfi/GCController input driver gets real input. */
++    if (@available(visionOS 2.0, *)) {
++        GCEventInteraction *padIntent = [[GCEventInteraction alloc] init];
++        padIntent.handledEventTypes  = GCUIEventTypeGamepad;
++        [self.view addInteraction:padIntent];
++    }
++#endif
+ #if TARGET_OS_IOS
+     UISwipeGestureRecognizer *swipe = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(showNativeMenu)];
+     swipe.numberOfTouchesRequired   = 4;
+@@ -889,6 +943,9 @@ void osx_show_file_sheet(void)
+ 
+ void *cocoa_screen_get_chosen(void)
+ {
++#if TARGET_OS_VISION
++    return NULL; /* visionOS: no UIScreen / [UIScreen screens] */
++#else
+     unsigned monitor_index;
+     settings_t *settings = config_get_ptr();
+     NSArray *screens     = [RAScreen screens];
+@@ -900,6 +957,7 @@ void osx_show_file_sheet(void)
+     if (monitor_index >= [screens count])
+         return (BRIDGE void*)screens;
+     return ((BRIDGE void*)[screens objectAtIndex:monitor_index]);
++#endif
+ }
+ 
+ /* Main-thread trampoline for threaded video.
+@@ -1083,6 +1141,9 @@ static float get_from_selector(
+ /* NOTE: nativeScale only available on iOS 8.0 and up. */
+ float cocoa_screen_get_native_scale(void)
+ {
++#if TARGET_OS_VISION
++    return 2.0f; /* visionOS: no UIScreen; nominal 2x backing scale */
++#else
+     SEL selector;
+     static CGFloat ret   = 0.0f;
+     RAScreen *screen     = NULL;
+@@ -1110,6 +1171,7 @@ float cocoa_screen_get_native_scale(void)
+        ret = 1.0f;
+ #endif
+     return ret;
++#endif /* !TARGET_OS_VISION */
+ }
+ #endif
+ 
+@@ -1186,7 +1248,11 @@ float cocoa_get_refresh_rate(void)
+    }
+ #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 100300 || __TV_OS_VERSION_MAX_ALLOWED >= 100200
+    if (@available(iOS 10.3, tvOS 10.2, *))
++#if TARGET_OS_VISION
++      return 90.0f; /* visionOS: no UIScreen */
++#else
+       return [UIScreen mainScreen].maximumFramesPerSecond;
++#endif
+ #endif
+    return 60.0f;
+ #endif
+@@ -1195,7 +1261,15 @@ float cocoa_get_refresh_rate(void)
+ void cocoa_get_video_output_size(unsigned *width, unsigned *height,
+       char *desc, size_t desc_len)
+ {
+-#if TARGET_OS_IPHONE
++#if TARGET_OS_VISION
++   /* visionOS has no UIScreen; the render target is the Metal drawable, which
++    * setVideoMode drives to a ~3840 long edge. Report ~4K so Settings -> Output
++    * -> Screen Resolution reflects the real render size, not a stale 1080p. */
++   *width  = 3840;
++   *height = 2160;
++   if (desc && desc_len > 0)
++      strlcpy(desc, "Vision Pro 4K", desc_len);
++#elif TARGET_OS_IPHONE
+    UIScreen *screen = [UIScreen mainScreen];
+ #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000 || __TV_OS_VERSION_MAX_ALLOWED >= 90000
+    if (@available(iOS 8.0, tvOS 9.0, *))
+@@ -1340,6 +1414,14 @@ bool cocoa_get_metrics(
+       void *data, enum display_metric_types type,
+       float *value)
+ {
++#if TARGET_OS_VISION
++   /* visionOS: no UIScreen. Nominal metrics; a floating window, tablet-class idiom. */
++   float   scale                 = cocoa_screen_get_native_scale();
++   float   physical_width        = 1920.0f;
++   float   physical_height       = 1080.0f;
++   float   dpi                   = 160 * scale;
++   NSInteger idiom_type          = 1; /* UIUserInterfaceIdiomPad */
++#else
+    RAScreen *screen              = (BRIDGE RAScreen*)cocoa_screen_get_chosen();
+    float   scale                 = cocoa_screen_get_native_scale();
+    CGRect  screen_rect           = [screen bounds];
+@@ -1347,6 +1429,7 @@ bool cocoa_get_metrics(
+    float   physical_height       = screen_rect.size.height * scale;
+    float   dpi                   = 160                     * scale;
+    NSInteger idiom_type          = UI_USER_INTERFACE_IDIOM();
++#endif
+ 
+    switch (idiom_type)
+    {

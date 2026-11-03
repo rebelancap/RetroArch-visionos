@@ -1,0 +1,179 @@
+diff --git a/cores/mesen/Core/HdPackLoader.cpp b/cores/mesen/Core/HdPackLoader.cpp
+--- a/cores/mesen/Core/HdPackLoader.cpp
++++ b/cores/mesen/Core/HdPackLoader.cpp
+@@ -553,31 +553,121 @@
+ 	return false;
+ }
+ 
+-bool HdPackLoader::CheckFile(string filename)
+-{
+-	if(_loadFromZip) {
+-		return _reader.CheckFile(filename);
+-	} else {
+-		ifstream file(FolderUtilities::CombinePath(_hdPackFolder, filename), ios::in | ios::binary);
+-		if(file.good()) {
+-			return true;
+-		}
+-	}
+-
+-	return false;
+-}
+-
+-bool HdPackLoader::LoadFile(string filename, vector<uint8_t> &fileData)
+-{
+-	fileData.clear();
+-
+-	if(_loadFromZip) {
+-		if(_reader.ExtractFile(filename, fileData)) {
+-			return true;
+-		}
+-	} else {
+-		ifstream file(FolderUtilities::CombinePath(_hdPackFolder, filename), ios::in | ios::binary);
+-		if(file.good()) {
++/* --- 0062: case-insensitive filename resolution ----------------------
++ *
++ * HD packs are authored on Windows and macOS, where the filesystem is
++ * case-INSENSITIVE, so nothing ever forced an author's `hires.txt` to agree
++ * with their own filenames. An iOS/visionOS data container is case-SENSITIVE,
++ * and any copy path that folds names (the tester's did — folders, PNGs and the
++ * `HdPacks` directory all arrived lower-case) then makes the FIRST `<img>` line
++ * fail, which rejects the WHOLE pack.
++ *
++ * Every name a pack refers to is therefore resolved against the real directory
++ * listing before it is opened. Note what this does NOT do: it never lower-cases
++ * a path and opens that. The resolved path is assembled out of actual
++ * `readdir()` entries, so the name that reaches `open()` is a name that exists.
++ */
++static std::string hdpack_resolve_component(const std::string &parent, const std::string &name)
++{
++	std::vector<std::string> names;
++	int err = 0;
++	if(!hdpack_read_dir(parent, names, err)) {
++		return name;
++	}
++	for(const std::string &n : names) {
++		if(hdpack_iequals(n, name)) {
++			return n;
++		}
++	}
++	return name;
++}
++
++/* One line per file that actually needed correcting, and only for the first
++ * few: a 300-image pack must not write 300 log lines. Reset per pack folder. */
++static void hdpack_case_note(const std::string &folder, const std::string &wanted, const std::string &got)
++{
++	static std::string lastFolder;
++	static int shown = 0;
++	if(folder != lastFolder) {
++		lastFolder = folder;
++		shown = 0;
++	}
++	if(shown < 6) {
++		hdpack_beacon("hdpack: case-resolved \"" + wanted + "\" -> \"" + got + "\"");
++	} else if(shown == 6) {
++		hdpack_beacon("hdpack: (more names needed the same correction; not logging each one)");
++	}
++	shown++;
++}
++
++/* The on-disk path for a name out of hires.txt. Exact match is the fast path
++ * (one stat, no readdir); only a miss costs a directory read. Subdirectories
++ * are resolved component by component, and a Windows-authored `a\dir\b.png`
++ * separator is accepted. Returns the unresolved path when nothing matches, so
++ * the caller's existing "NOT FOUND" beacon still reports the name as written. */
++static std::string hdpack_resolve_path(const std::string &folder, const std::string &filename)
++{
++	std::string direct = FolderUtilities::CombinePath(folder, filename);
++	struct stat st;
++	if(filename.empty() || stat(direct.c_str(), &st) == 0) {
++		return direct;
++	}
++
++	std::string rest = filename;
++	for(size_t i = 0; i < rest.size(); i++) {
++		if(rest[i] == '\\') {
++			rest[i] = '/';
++		}
++	}
++
++	std::string cur = folder;
++	size_t pos = 0;
++	for(;;) {
++		size_t slash = rest.find('/', pos);
++		std::string comp = (slash == std::string::npos) ? rest.substr(pos) : rest.substr(pos, slash - pos);
++		if(!comp.empty() && comp != ".") {
++			cur = FolderUtilities::CombinePath(cur, hdpack_resolve_component(cur, comp));
++		}
++		if(slash == std::string::npos) {
++			break;
++		}
++		pos = slash + 1;
++	}
++
++	if(cur != direct && stat(cur.c_str(), &st) == 0) {
++		hdpack_case_note(folder, filename, cur);
++	}
++	return cur;
++}
++
++bool HdPackLoader::CheckFile(string filename)
++{
++	if(_loadFromZip) {
++		return _reader.CheckFile(filename);
++	} else {
++		/* 0062: open the name that is really on disk, whatever its casing. */
++		ifstream file(hdpack_resolve_path(_hdPackFolder, filename), ios::in | ios::binary);
++		if(file.good()) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
++bool HdPackLoader::LoadFile(string filename, vector<uint8_t> &fileData)
++{
++	fileData.clear();
++
++	if(_loadFromZip) {
++		if(_reader.ExtractFile(filename, fileData)) {
++			return true;
++		}
++	} else {
++		/* 0062: ditto — this is the call every <img>, <background>, <patch>,
++		 * <bgm>/<sfx>, palette.dat and hires.txt itself goes through. */
++		ifstream file(hdpack_resolve_path(_hdPackFolder, filename), ios::in | ios::binary);
++		if(file.good()) {
+ 			file.seekg(0, ios::end);
+ 			uint32_t fileSize = (uint32_t)file.tellg();
+ 			file.seekg(0, ios::beg);
+@@ -793,6 +793,7 @@
+ 	if(_loadFromZip) {
+ 		_data->PatchesByHash[tokens[1]] = VirtualFile(_hdPackFolder, tokens[0]);
+ 	} else {
+-		_data->PatchesByHash[tokens[1]] = FolderUtilities::CombinePath(_hdPackFolder, tokens[0]);
++		/* 0062: store the real on-disk name, not the one hires.txt wrote. */
++		_data->PatchesByHash[tokens[1]] = hdpack_resolve_path(_hdPackFolder, tokens[0]);
+ 	}
+ }
+@@ -1145,7 +1145,8 @@
+ 			VirtualFile file(_hdPackFolder, tokens[2]);
+ 			_data->BgmFilesById[trackId] = file;
+ 		} else {
+-			_data->BgmFilesById[trackId] = FolderUtilities::CombinePath(_hdPackFolder, tokens[2]);
++			/* 0062: as above — CheckFile() already found it case-insensitively. */
++			_data->BgmFilesById[trackId] = hdpack_resolve_path(_hdPackFolder, tokens[2]);
+ 		}
+ 	}
+ }
+@@ -1158,7 +1158,8 @@
+ 			VirtualFile file(_hdPackFolder, tokens[2]);
+ 			_data->SfxFilesById[trackId] = file;
+ 		} else {
+-			_data->SfxFilesById[trackId] = FolderUtilities::CombinePath(_hdPackFolder, tokens[2]);
++			/* 0062: as above. */
++			_data->SfxFilesById[trackId] = hdpack_resolve_path(_hdPackFolder, tokens[2]);
+ 		}
+ 	}
+ }

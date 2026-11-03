@@ -1,0 +1,23 @@
+# Vendored upstream trees, re-created by scripts/bootstrap.sh at pinned commits.
+# Local changes live in overlay/patches/, never in vendor/.
+/vendor/
+
+# Build outputs and caches
+/build-*/
+/work/
+/OTA-VERSION
+DerivedData/
+*.xcarchive
+*.ipa
+*.o
+*.a
+*.dylib
+
+# Game content and 3D profiles are user-supplied: never commit them
+*.3dn
+index.bin
+
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+*.xcuserstate

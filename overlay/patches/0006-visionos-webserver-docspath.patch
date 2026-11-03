@@ -1,0 +1,13 @@
+diff --git a/pkg/apple/WebServer/WebServer.m b/pkg/apple/WebServer/WebServer.m
+index 82d3cca..16dbfd6 100644
+--- a/pkg/apple/WebServer/WebServer.m
++++ b/pkg/apple/WebServer/WebServer.m
+@@ -26,7 +26,7 @@ +(WebServer*)sharedInstance {
+ 
+ -(instancetype)init {
+     if ( self = [super init] ) {
+-#if TARGET_OS_IOS
++#if TARGET_OS_IOS || TARGET_OS_VISION
+         NSString* docsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+ #elif TARGET_OS_TV
+         NSString* docsPath = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];

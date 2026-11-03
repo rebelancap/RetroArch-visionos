@@ -1,0 +1,55 @@
+diff --git a/gfx/video_driver.c b/gfx/video_driver.c
+index 96c4f69..aebaf61 100644
+--- a/gfx/video_driver.c
++++ b/gfx/video_driver.c
+@@ -169,9 +169,12 @@ static const gfx_ctx_driver_t *gfx_ctx_gl_drivers[] = {
+    &gfx_ctx_qnx,
+ #endif
+ #if defined(HAVE_COCOA) || defined(HAVE_COCOATOUCH) || defined(HAVE_COCOA_METAL)
+-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
++#if (defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)) && !defined(RA_VISIONOS)
+    &gfx_ctx_cocoagl,
+ #endif
++#if defined(RA_VISIONOS) && defined(HAVE_ANGLE)
++   &gfx_ctx_cocoa_angle,
++#endif
+ #endif
+ #if (defined(HAVE_SDL) || defined(HAVE_SDL2)) && (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE)) && !defined(HAVE_COCOA)
+    &gfx_ctx_sdl_gl,
+@@ -2296,6 +2299,9 @@ void video_driver_monitor_reset(void)
+    video_st->frame_time_count = 0;
+ }
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h> /* TARGET_OS_VISION for the patch-0015 window hook */
++#endif
+ void video_driver_set_aspect_ratio(void)
+ {
+    settings_t  *settings              = config_get_ptr();
+@@ -2340,6 +2346,26 @@ void video_driver_set_aspect_ratio(void)
+ 
+    if (poke && poke->set_aspect_ratio)
+       poke->set_aspect_ratio(video_st->data, aspect_ratio_idx);
++
++#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
++   /* overlay patch 0015 (+0018): shape the visionOS window to the applied content
++    * aspect (kills the pillarbox) — but ONLY while real content is running and the
++    * menu is closed. The default Ozone/glui menu is aspect-agnostic (it reflows to
++    * fill the window), so forcing the game's DAR — or the stale ~1:1 CORE value
++    * present at launch with no content — squishes/stretches the menu. In those
++    * states request a neutral landscape (16:9) instead. The menu-toggle funnels
++    * (retroarch_menu_running[_finished]) re-fire this event so the window flips
++    * neutral<->content on open/close. */
++   {
++      extern void cocoa_vision_window_match_aspect(float aspect, unsigned rotation);
++      extern bool content_is_inited(void);
++      bool menu_alive  = (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE) != 0;
++      bool use_content = content_is_inited() && !menu_alive;
++      float win_aspect = use_content ? video_st->aspect_ratio : (16.0f / 9.0f);
++      unsigned win_rot = use_content ? retroarch_get_rotation() : 0;
++      cocoa_vision_window_match_aspect(win_aspect, win_rot);
++   }
++#endif
+ }
+ 
+ void video_viewport_get_scaled_aspect2(struct video_viewport *vp,

@@ -1,0 +1,58 @@
+diff --git a/cores/mesen/Core/HdPpu.cpp b/cores/mesen/Core/HdPpu.cpp
+--- a/cores/mesen/Core/HdPpu.cpp
++++ b/cores/mesen/Core/HdPpu.cpp
+@@ -18,8 +18,25 @@
+ 		bool isChrRam = !_console->GetMapper()->HasChrRom();
+ 		BaseMapper *mapper = _console->GetMapper();
+ 
+-		uint32_t color = GetPixelColor();
+-		pixel = (_paletteRAM[color & 0x03 ? color : 0] & _paletteRamMask) | _intensifyColorBits;
++		/* 0057: RA3D — same capture PPU::DrawPixel() does. GetPixelColor()
++		 * below is what sets _ra3dSprPixel/_ra3dSprInFront, so it has to be
++		 * cleared first, exactly as in the base class. */
++		_ra3dSprPixel = RA3D_TRANSPARENT;
++		uint32_t color = GetPixelColor();
++		pixel = (_paletteRAM[color & 0x03 ? color : 0] & _paletteRamMask) | _intensifyColorBits;
++
++		{
++			uint32_t ra3dBg = GetBackgroundPixelColor();
++			/* Colour 0 is TRANSPARENT on the NES: the backdrop shows there, and
++			 * so does any behind-priority sprite. */
++			_ra3dLayer[0][bufferOffset] = (ra3dBg & 0x03) ? _paletteRAM[ra3dBg] : RA3D_TRANSPARENT;
++			_ra3dLayer[1][bufferOffset] = RA3D_TRANSPARENT;
++			_ra3dLayer[2][bufferOffset] = RA3D_TRANSPARENT;
++			_ra3dLayer[3][bufferOffset] = _paletteRAM[0];
++			if(_ra3dSprPixel != RA3D_TRANSPARENT && _settings->GetSpritesEnabled()) {
++				_ra3dLayer[_ra3dSprInFront ? 1 : 2][bufferOffset] = _paletteRAM[_ra3dSprPixel & 0x03 ? _ra3dSprPixel : 0];
++			}
++		}
+ 
+ 		TileInfo* lastTile = &((_state.XScroll + ((_cycle - 1) & 0x07) < 8) ? _previousTile : _currentTile);
+ 		uint32_t backgroundColor = 0;
+@@ -156,5 +156,24 @@
+ 		}
+ 	}
+ 
+-	_console->GetVideoDecoder()->UpdateFrameSync(_currentOutputBuffer, _info);
+-}
++	/* 0057: RA3D — the publish block from PPU::SendFrame(), which this override
++	 * would otherwise skip entirely, leaving the depth planes frozen (or never
++	 * written at all) for the whole time an HD pack is loaded. Written into the
++	 * half the reader is not holding, then the index is released. */
++	{
++		uint32_t *ra3dPal = _settings->GetRgbPalette();
++		int ra3dWrite = (_ra3dReadIdx.load(std::memory_order_relaxed) == 0) ? 1 : 0;
++		for(int plane = 0; plane < RA3D_PLANES; plane++) {
++			const uint16_t *src = _ra3dLayer[plane];
++			uint32_t *dst = _ra3dPublished[ra3dWrite][plane];
++			for(int i = 0; i < 256*240; i++) {
++				uint16_t v = src[i];
++				dst[i] = (v == RA3D_TRANSPARENT) ? 0u : (ra3dPal[v & 0x1FF] | 0xFF000000u);
++			}
++		}
++		_ra3dFrame.fetch_add(1, std::memory_order_relaxed);
++		_ra3dReadIdx.store(ra3dWrite, std::memory_order_release);
++	}
++
++	_console->GetVideoDecoder()->UpdateFrameSync(_currentOutputBuffer, _info);
++}

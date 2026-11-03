@@ -1,0 +1,73 @@
+diff --git a/runloop.c b/runloop.c
+--- a/runloop.c
++++ b/runloop.c
+@@ -1288,6 +1288,18 @@
+-   if (*options_path)
+-      return core_option_manager_new(options_path,
+-            src_options_path, options_v2,
+-            categories_enabled);
+-   return NULL;
+-}
++#if defined(RA_VISIONOS)
++   /* 0040: name the options file, so "my menu change did nothing" can be told
++    * apart from "the menu wrote a file the core never reads". */
++   {
++      char _m[320];
++      extern void RA_BeaconMark(const char *);
++      snprintf(_m, sizeof(_m), "core opts file: %s (src %s)",
++            *options_path ? options_path : "<none>",
++            *src_options_path ? src_options_path : "<none>");
++      RA_BeaconMark(_m);
++   }
++#endif
++   if (*options_path)
++      return core_option_manager_new(options_path,
++            src_options_path, options_v2,
++            categories_enabled);
++   return NULL;
++}
+@@ -1449,2 +1449,25 @@
+-            RARCH_DBG("[Environ] GET_VARIABLE: %s = \"%s\"\n",
+-                  var->key, var->value);
++            RARCH_DBG("[Environ] GET_VARIABLE: %s = \"%s\"\n",
++                  var->key, var->value);
++#if defined(RA_VISIONOS)
++            /* 0040: beacon the GLideN64 geometry options as RA delivers them,
++             * once per distinct value, so a device log says whether a menu
++             * change ever reached the core. */
++            if (     strstr(var->key, "aspect")
++                  || strstr(var->key, "screensize")
++                  || strstr(var->key, "NativeResFactor"))
++            {
++               static char last_key[64];
++               static char last_val[64];
++               if (     strncmp(last_key, var->key,   sizeof(last_key) - 1)
++                     || strncmp(last_val, var->value, sizeof(last_val) - 1))
++               {
++                  char _m[192];
++                  extern void RA_BeaconMark(const char *);
++                  strlcpy(last_key, var->key,   sizeof(last_key));
++                  strlcpy(last_val, var->value, sizeof(last_val));
++                  snprintf(_m, sizeof(_m), "core opt: %s = \"%s\"",
++                        var->key, var->value);
++                  RA_BeaconMark(_m);
++               }
++            }
++#endif
+@@ -2949,2 +2949,14 @@
+-            RARCH_LOG("[Environ] SET_GEOMETRY: %ux%u, Aspect: %.3f.\n",
+-                  geom->base_width, geom->base_height, geom->aspect_ratio);
++            RARCH_LOG("[Environ] SET_GEOMETRY: %ux%u, Aspect: %.3f.\n",
++                  geom->base_width, geom->base_height, geom->aspect_ratio);
++#if defined(RA_VISIONOS)
++            {
++               char _m[192];
++               extern void RA_BeaconMark(const char *);
++               snprintf(_m, sizeof(_m),
++                     "av geom: base=%ux%u max=%ux%u ar=%.4f",
++                     geom->base_width, geom->base_height,
++                     geom->max_width,  geom->max_height,
++                     geom->aspect_ratio);
++               RA_BeaconMark(_m);
++            }
++#endif

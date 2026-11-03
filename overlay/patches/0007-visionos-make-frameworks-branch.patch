@@ -1,0 +1,38 @@
+diff --git a/pkg/apple/make-frameworks.sh b/pkg/apple/make-frameworks.sh
+index 1467f22..bab335c 100755
+--- a/pkg/apple/make-frameworks.sh
++++ b/pkg/apple/make-frameworks.sh
+@@ -15,6 +15,11 @@ if [ "$PLATFORM_FAMILY_NAME" = "tvOS" ] ; then
+     SUFFIX="_tvos"
+     PLATFORM="tvos"
+     DEPLOYMENT_TARGET="${TVOS_DEPLOYMENT_TARGET}"
++elif [ "$PLATFORM_FAMILY_NAME" = "visionOS" -o "$PLATFORM_FAMILY_NAME" = "xrOS" ] ; then
++    BASE_DIR="visionOS"
++    SUFFIX="_xros"
++    PLATFORM="xros"
++    DEPLOYMENT_TARGET="${XROS_DEPLOYMENT_TARGET}"
+ elif [ "$PLATFORM_FAMILY_NAME" = "iOS" ] ; then
+     BASE_DIR="iOS"
+     SUFFIX="_ios"
+@@ -147,3 +152,21 @@ if [ "$PLATFORM_FAMILY_NAME" = "macOS" ] ; then
+             > "$ICD_DIR/MoltenVK_icd.json"
+     fi
+ fi
++
++
++# ANGLE (GLES3-over-Metal) for visionOS — embedded like MoltenVK.
++# The simulator needs its own VISIONOSSIMULATOR slice: embedding the device
++# dylib makes dyld refuse the whole app at launch ("incompatible platform").
++if [ "$PLATFORM_FAMILY_NAME" = "visionOS" -o "$PLATFORM_FAMILY_NAME" = "xrOS" ] ; then
++    ANGLE_DIR="${SRCROOT}/Frameworks/angle-xros"
++    case "$PLATFORM_NAME" in
++        xrsimulator*) [ -d "${SRCROOT}/Frameworks/angle-xros-sim" ] && ANGLE_DIR="${SRCROOT}/Frameworks/angle-xros-sim" ;;
++    esac
++    for f in libANGLE-shared.dylib libEGLGLES_shim.dylib ; do
++        if [ -f "$ANGLE_DIR/$f" ] ; then
++            echo "copying angle lib $f (from $(basename "$ANGLE_DIR"))"
++            cp "$ANGLE_DIR/$f" "${OUTDIR}/"
++            codesign --force --verbose --sign "${CODE_SIGN_IDENTITY_FOR_ITEMS}" "${OUTDIR}/$f"
++        fi
++    done
++fi

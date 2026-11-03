@@ -1,0 +1,317 @@
+diff --git a/gfx/drivers/gl2.c b/gfx/drivers/gl2.c
+--- a/gfx/drivers/gl2.c
++++ b/gfx/drivers/gl2.c
+@@ -3558,7 +3558,243 @@
+    gl2_renderchain_readback(gl, gl->renderchain_data,
+          gl2_get_alignment(gl->vp.width * sizeof(uint32_t)),
+          fmt, type, NULL);
+    gl2_renderchain_unbind_pbo();
+ }
++#if defined(RA_VISIONOS) && defined(RA_VISION_PIXEL_DUMP)
++/* 0044: content-gated two-stage device pixel capture + statistics.
++ * See scripts/gen-patch-0044.py for the full rationale. */
++#include <stdio.h>
++#include <sys/stat.h>
++
++/* Filled by the pre-composite probe at the top of gl2_frame, reported by the
++ * capture beacon: how much of the DEFAULT framebuffer is already non-black
++ * BEFORE RetroArch clears and composes. */
++static unsigned ra_vision_pre_nb  = 0;
++static unsigned ra_vision_pre_tot = 0;
++
++typedef struct
++{
++   unsigned nb;                     /* non-black pixels (max channel > 8) */
++   unsigned maxv;                   /* brightest channel value seen       */
++   unsigned x0, y0, x1, y1;         /* bbox of non-black, y from BOTTOM   */
++} ra_vision_stats_t;
++
++static void ra_vision_scan(const unsigned char *rgba,
++      unsigned w, unsigned h, ra_vision_stats_t *s)
++{
++   unsigned x, y;
++   s->nb   = 0;
++   s->maxv = 0;
++   s->x0   = w;  s->y0 = h;
++   s->x1   = 0;  s->y1 = 0;
++   for (y = 0; y < h; y++)
++   {
++      const unsigned char *p = rgba + (size_t)y * w * 4;
++      for (x = 0; x < w; x++, p += 4)
++      {
++         unsigned v = p[0];
++         if (p[1] > v) v = p[1];
++         if (p[2] > v) v = p[2];
++         if (v > s->maxv)
++            s->maxv = v;
++         if (v > 8)
++         {
++            s->nb++;
++            if (x < s->x0) s->x0 = x;
++            if (x > s->x1) s->x1 = x;
++            if (y < s->y0) s->y0 = y;
++            if (y > s->y1) s->y1 = y;
++         }
++      }
++   }
++   if (!s->nb)
++   {
++      s->x0 = s->y0 = s->x1 = s->y1 = 0;
++   }
++}
++
++/* Cheap "is there a picture at all" probe: reads the centre (w/8 x h/8) rect of
++ * `fbo` and counts non-black pixels. ~0.5 MB at 4K. Binding is restored. */
++static unsigned ra_vision_probe(GLuint fbo, unsigned fw, unsigned fh)
++{
++   unsigned char *buf;
++   GLint          prev = 0;
++   unsigned       i, nb = 0;
++   unsigned       pw   = fw / 8;
++   unsigned       ph   = fh / 8;
++
++   if (pw < 16 || ph < 16)
++      return 0;
++   if (!(buf = (unsigned char*)malloc((size_t)pw * ph * 4)))
++      return 0;
++
++   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
++   gl2_bind_fb(fbo);
++   glPixelStorei(GL_PACK_ALIGNMENT, 1);
++   while (glGetError() != GL_NO_ERROR);
++   glReadPixels(fw / 2 - pw / 2, fh / 2 - ph / 2, pw, ph,
++         GL_RGBA, GL_UNSIGNED_BYTE, buf);
++   if (glGetError() == GL_NO_ERROR)
++   {
++      for (i = 0; i < pw * ph; i++)
++      {
++         const unsigned char *p = buf + (size_t)i * 4;
++         unsigned v = p[0];
++         if (p[1] > v) v = p[1];
++         if (p[2] > v) v = p[2];
++         if (v > 8)
++            nb++;
++      }
++   }
++   free(buf);
++   gl2_bind_fb((GLuint)prev);
++   return nb;
++}
++
++/* 24-bit BMP, bottom-up — which is also glReadPixels' row order, so the rows go
++ * out in the order they came in. `step` point-samples the image down. */
++static void ra_vision_write_bmp(const char *path,
++      const unsigned char *rgba, unsigned w, unsigned h, unsigned step)
++{
++   FILE          *f;
++   unsigned char *line;
++   unsigned char  hdr[54];
++   unsigned       x, y;
++   unsigned       ow     = w / step;
++   unsigned       oh     = h / step;
++   unsigned       row    = ow * 3;
++   unsigned       pad    = (4 - (row & 3)) & 3;
++   unsigned       stride = row + pad;
++   unsigned       size   = 54 + stride * oh;
++
++   if (!ow || !oh)
++      return;
++   if (!(f = fopen(path, "wb")))
++      return;
++
++   memset(hdr, 0, sizeof(hdr));
++   hdr[0]  = 'B';  hdr[1] = 'M';
++   hdr[2]  =  size        & 0xff; hdr[3]  = (size  >>  8) & 0xff;
++   hdr[4]  = (size >> 16) & 0xff; hdr[5]  = (size  >> 24) & 0xff;
++   hdr[10] = 54;    /* pixel data offset */
++   hdr[14] = 40;    /* BITMAPINFOHEADER  */
++   hdr[18] =  ow        & 0xff; hdr[19] = (ow >>  8) & 0xff;
++   hdr[20] = (ow >> 16) & 0xff; hdr[21] = (ow >> 24) & 0xff;
++   hdr[22] =  oh        & 0xff; hdr[23] = (oh >>  8) & 0xff;
++   hdr[24] = (oh >> 16) & 0xff; hdr[25] = (oh >> 24) & 0xff;
++   hdr[26] = 1;     /* planes */
++   hdr[28] = 24;    /* bpp    */
++   fwrite(hdr, 1, sizeof(hdr), f);
++
++   if (!(line = (unsigned char*)calloc(1, stride)))
++   {
++      fclose(f);
++      return;
++   }
++   for (y = 0; y < oh; y++)
++   {
++      const unsigned char *src = rgba + (size_t)(y * step) * w * 4;
++      for (x = 0; x < ow; x++)
++      {
++         const unsigned char *p = src + (size_t)(x * step) * 4;
++         line[x * 3 + 0] = p[2];   /* BMP is BGR */
++         line[x * 3 + 1] = p[1];
++         line[x * 3 + 2] = p[0];
++      }
++      fwrite(line, 1, stride, f);
++   }
++   free(line);
++   fclose(f);
++}
++
++static void ra_vision_capture_pair(gl2_t *gl, unsigned idx,
++      unsigned frame_width, unsigned frame_height, unsigned probe_nb,
++      uint64_t frame_count)
++{
++   const char       *home  = getenv("HOME");
++   unsigned char    *buf;
++   GLint             prev_fbo = 0;
++   GLenum            err_core = 0, err_present = 0;
++   ra_vision_stats_t sc, sp;
++   char              dir[512], path[640], msg[1024];
++   unsigned          dw     = gl->vp.full_width;
++   unsigned          dh     = gl->vp.full_height;
++   unsigned          cw     = frame_width;
++   unsigned          ch     = frame_height;
++   unsigned          step_c = 1, step_d = 1;
++   int               have_core = 0;
++
++   memset(&sc, 0, sizeof(sc));
++   memset(&sp, 0, sizeof(sp));
++
++   if (!home || !dw || !dh)
++      return;
++
++   snprintf(dir, sizeof(dir), "%s/Documents/RetroArch/screenshots", home);
++   mkdir(dir, 0755);   /* harmless if it already exists */
++
++   if (cw > 960) step_c = (cw + 959) / 960;
++   if (dw > 960) step_d = (dw + 959) / 960;
++
++   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
++   glPixelStorei(GL_PACK_ALIGNMENT, 1);
++
++   /* ---- stage 1: what the CORE produced ---------------------------------
++    * hw_render_fbo[tex_index] is the FBO gl2_get_current_framebuffer() handed
++    * out for the frame just run (with hw render gl->textures == 1, so the
++    * index cannot drift), i.e. exactly the pixels GLideN64 wrote.  No
++    * glReadBuffer call: it is not declared in RetroArch's GLES build, and an
++    * FBO's read buffer defaults to COLOR_ATTACHMENT0 — glGetError() is
++    * reported so a failed read cannot be mistaken for a black frame. */
++   if (     (gl->flags & GL2_FLAG_HW_RENDER_FBO_INIT)
++         && cw && ch
++         && (buf = (unsigned char*)malloc((size_t)cw * ch * 4)))
++   {
++      gl2_bind_fb(gl->hw_render_fbo[gl->tex_index]);
++      while (glGetError() != GL_NO_ERROR);
++      glReadPixels(0, 0, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE, buf);
++      err_core = glGetError();
++      ra_vision_scan(buf, cw, ch, &sc);
++      snprintf(path, sizeof(path), "%s/cap%02u-1core-%ux%u.bmp", dir, idx, cw, ch);
++      ra_vision_write_bmp(path, buf, cw, ch, step_c);
++      free(buf);
++      have_core = 1;
++   }
++
++   /* ---- stage 2: what RetroArch PRESENTS ---------------------------------
++    * The default framebuffer with the whole composed frame in it, one call
++    * before the context driver swaps. */
++   gl2_bind_fb(0);
++   if ((buf = (unsigned char*)malloc((size_t)dw * dh * 4)))
++   {
++      while (glGetError() != GL_NO_ERROR);
++      glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, buf);
++      err_present = glGetError();
++      ra_vision_scan(buf, dw, dh, &sp);
++      snprintf(path, sizeof(path), "%s/cap%02u-2present-%ux%u.bmp", dir, idx, dw, dh);
++      ra_vision_write_bmp(path, buf, dw, dh, step_d);
++      free(buf);
++   }
++   gl2_bind_fb((GLuint)prev_fbo);
++
++   {
++      extern void RA_BeaconMark(const char *);
++      snprintf(msg, sizeof(msg),
++            "gl2 dump %u: fc=%llu probe=%u pre0=%u/%u | "
++            "core=%ux%u(%s /%u err=0x%x tex=%ux%u) nb=%u max=%u bbox=%u,%u-%u,%u | "
++            "present=%ux%u(/%u err=0x%x) nb=%u max=%u bbox=%u,%u-%u,%u | "
++            "vp=%u,%u %ux%u -> %s",
++            idx, (unsigned long long)frame_count, probe_nb,
++            ra_vision_pre_nb, ra_vision_pre_tot,
++            cw, ch, have_core ? "ok" : "SKIP", step_c,
++            (unsigned)err_core, gl->tex_w, gl->tex_h,
++            sc.nb, sc.maxv, sc.x0, sc.y0, sc.x1, sc.y1,
++            dw, dh, step_d, (unsigned)err_present,
++            sp.nb, sp.maxv, sp.x0, sp.y0, sp.x1, sp.y1,
++            gl->vp.x, gl->vp.y, gl->vp.width, gl->vp.height, dir);
++      RA_BeaconMark(msg);
++   }
++}
++#endif
+ 
+ static bool gl2_frame(void *data, const void *frame,
+@@ -3605,3 +3841,19 @@
+    gl->shader->use(gl, gl->shader_data, 1, true);
++#if defined(RA_VISIONOS) && defined(RA_VISION_PIXEL_DUMP)
++   /* 0044b: probe the DEFAULT framebuffer BEFORE RetroArch clears and composes.
++    *
++    * If the core ever blitted its picture straight into the window surface
++    * behind RetroArch's back, this is where it would show up as a non-black
++    * centre. (Source says it cannot: glsm rewrites framebuffer 0 to
++    * RetroArch's hardware-render FBO, and GLideN64's default framebuffer
++    * handle is 0.) Twice a second, ~0.5 MB per read. */
++   if (frame_count >= 240 && (frame_count % 30) == 0
++         && gl->vp.full_width && gl->vp.full_height)
++   {
++      ra_vision_pre_tot = (gl->vp.full_width / 8) * (gl->vp.full_height / 8);
++      ra_vision_pre_nb  = ra_vision_probe(0,
++            gl->vp.full_width, gl->vp.full_height);
++   }
++#endif
+ 
+ #ifdef IOS
+@@ -3865,4 +4117,49 @@
+    if (gl->ctx_driver->update_window_title)
+       gl->ctx_driver->update_window_title(gl->ctx_data);
++#if defined(RA_VISIONOS) && defined(RA_VISION_PIXEL_DUMP)
++   /* 0044c: content-gated capture, up to four per content session.
++    *
++    * Revision 1 fired once, blind, at frame 300 — and landed inside one of
++    * SM64's several second-long black boot fades (mac harness,
++    * frames 60/120/360/420 are 100%
++    * black). Both stages came back black and the round learned nothing.
++    *
++    * Now: from frame 240, every 30th non-menu frame probes the core's own FBO
++    * cheaply; a full capture is taken only when there is actually a picture in
++    * it. Frame 1800 forces a capture regardless — a core FBO still black after
++    * 30 s is itself the answer and must be recorded. `frame_count` restarts at
++    * 0 on every content load, so "it went backwards" re-arms the whole set. */
++   {
++      static uint64_t last_fc  = 0;
++      static uint64_t next_try = 240;
++      static unsigned shots    = 0;
++      bool            menu_up  = false;
++#ifdef HAVE_MENU
++      menu_up = menu_is_alive;
++#endif
++      if (frame_count < last_fc)
++      {
++         shots    = 0;
++         next_try = 240;
++      }
++      last_fc = frame_count;
++
++      if (shots < 4 && frame && !menu_up && frame_count >= next_try)
++      {
++         unsigned probe_nb = 0;
++         if (gl->flags & GL2_FLAG_HW_RENDER_FBO_INIT)
++            probe_nb = ra_vision_probe(gl->hw_render_fbo[gl->tex_index],
++                  frame_width, frame_height);
++         if (probe_nb > 64 || frame_count >= 1800)
++         {
++            ra_vision_capture_pair(gl, ++shots, frame_width, frame_height,
++                  probe_nb, frame_count);
++            next_try = frame_count + 900;
++         }
++         else
++            next_try = frame_count + 30;
++      }
++   }
++#endif
+ 
+    /* Reset state which could easily mess up libretro core. */

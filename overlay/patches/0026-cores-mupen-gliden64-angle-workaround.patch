@@ -1,0 +1,25 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp
+index 0f79bbc..8f9813c 100644
+--- a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/opengl_GLInfo.cpp
+@@ -189,11 +189,16 @@ void GLInfo::init() {
+ 		config.generalEmulation.enableFragmentDepthWrite = 0;
+ 	}
+ 
+-#ifdef OS_ANDROID
++	/* ANGLE workaround — applies wherever the renderer IS ANGLE, not just on
++	 * Android. Upstream gated this to OS_ANDROID because that was the only ANGLE
++	 * target they tested; on visionOS we drive ANGLE (GLES3-over-Metal) too, so
++	 * none of GLideN64's known-ANGLE quirk handling was active (GLInfo already
++	 * sets Renderer::Angle from the "ANGLE" version string). Fragment-depth-write
++	 * over ANGLE is a known-bad combo and interacts with the decal draw class.
++	 * */
+ 	if (renderer == Renderer::Angle) {
+-        config.generalEmulation.enableFragmentDepthWrite = 0;
+-    }
+-#endif
++		config.generalEmulation.enableFragmentDepthWrite = 0;
++	}
+ 
+ 	depthTexture = !isGLES2 || Utils::isExtensionSupported(*this, "GL_OES_depth_texture");
+ 	noPerspective = Utils::isExtensionSupported(*this, "GL_NV_shader_noperspective_interpolation");

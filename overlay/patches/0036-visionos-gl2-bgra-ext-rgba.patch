@@ -1,0 +1,32 @@
+diff --git a/gfx/drivers/gl2.c b/gfx/drivers/gl2.c
+--- a/gfx/drivers/gl2.c
++++ b/gfx/drivers/gl2.c
+@@ -4108,8 +4108,28 @@
+       video_driver_set_disp_flags(video_driver_get_disp_flags() | VIDEO_FLAG_USE_RGBA);
+       RARCH_WARN("[GL] GLES implementation does not have BGRA8888 extension.\n"
+                  "[GL] 32-bit path will require conversion.\n");
++   }
++#if defined(IOS)
++   /* On Apple mobile targets RARCH_GL_INTERNAL_FORMAT32 is GL_RGBA while the
++    * upload format stays GL_BGRA_EXT (the "Stupid Apple" case above). That
++    * mismatch is legal only under APPLE_texture_format_BGRA8888, i.e. under
++    * EAGL. visionOS has no EAGL - GLES comes from ANGLE, which implements the
++    * EXT variant, where internalformat and format MUST match. Every 32-bit
++    * upload (gfx_display's 1x1 white texture, menu icons, software-core frames)
++    * then fails with GL_INVALID_OPERATION, leaves the texture without storage
++    * and samples as opaque black: the ozone menu keeps its text and its font
++    * atlas but loses every flat quad (dimming backdrop, selection highlight and
++    * border, separator lines). Fall back to the plain RGBA path there.
++    * Root cause + repro: */
++   else if (!gl_query_extension("APPLE_texture_format_BGRA8888"))
++   {
++      video_driver_set_disp_flags(video_driver_get_disp_flags() | VIDEO_FLAG_USE_RGBA);
++      RARCH_WARN("[GL] Only the EXT flavour of BGRA8888 is present; "
++                 "internalformat GL_RGBA with format GL_BGRA_EXT is invalid there.\n"
++                 "[GL] 32-bit path will use RGBA.\n");
+    }
+ #endif
++#endif
+ 
+ #ifdef GL_DEBUG
+    /* Useful for debugging, but kinda obnoxious otherwise. */

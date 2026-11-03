@@ -1,0 +1,119 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp
+--- a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp
+@@ -154,6 +154,54 @@
+ void DisplayWindowMupen64plus::_stop()
+ {
+     FunctionWrapper::CoreVideo_Quit();
+ }
++
++/* 0048: beacon writer — see scripts/gen-patch-0048.py. A local copy of 0042's
++ * (dlsym RA_BeaconMark when the host exports it, else append the identical
++ * timestamped line ourselves — the frontend is built LLVM_LTO=YES_THIN and
++ * ThinLTO internalizes RA_BeaconMark, so the dlsym returns NULL on device,
++ *), kept self-contained so the two overlay patches stay independent. */
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <time.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++static void gliden64_geom_beacon(const char *m)
++{
++	static void (*ra_beacon)(const char *) = NULL;
++	static bool looked_up = false;
++	if (!looked_up) {
++		looked_up = true;
++		ra_beacon = (void (*)(const char *))dlsym(RTLD_DEFAULT, "RA_BeaconMark");
++	}
++	if (ra_beacon != NULL) {
++		ra_beacon(m);
++		return;
++	}
++	{
++		const char *home = getenv("HOME");
++		char path[1024];
++		int fd;
++		if (home == NULL)
++			return;
++		snprintf(path, sizeof(path), "%s/Documents/launch-beacon.log", home);
++		fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
++		if (fd >= 0) {
++			time_t tt = time(NULL);
++			struct tm tmv;
++			char line[512];
++			int n;
++			localtime_r(&tt, &tmv);
++			n = snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d  %s\n",
++				tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
++				tmv.tm_hour, tmv.tm_min, tmv.tm_sec, m);
++			if (n > 0)
++				(void)write(fd, line, (size_t)n);
++			close(fd);
++		}
++	}
++}
+ 
+ void DisplayWindowMupen64plus::_restart()
+@@ -167,4 +215,60 @@
+ void DisplayWindowMupen64plus::_swapBuffers()
+ {
++	/* 0048: re-derive the output geometry from the live core options, every
++	 * frame. See scripts/gen-patch-0048.py for the full reasoning; in short,
++	 * config.frameBufferEmulation.aspect and the window size are latched at
++	 * _start() into a process-lifetime singleton, Config_LoadConfig() resets the
++	 * aspect to a43 before copying AspectRatio back, and nothing re-runs
++	 * _setBufferSize() afterwards — so the frontend can be showing "16:9
++	 * adjusted" while GLideN64 is still laying the frame out as 4:3. When
++	 * nothing has drifted this is two comparisons and no side effect. */
++	{
++		const u32 want_w = get_retro_screen_width();
++		const u32 want_h = get_retro_screen_height();
++		const int want_a = (int)AspectRatio;
++		bool drifted = false;
++
++		if ((int)config.frameBufferEmulation.aspect != want_a) {
++			config.frameBufferEmulation.aspect = (Config::Aspect)want_a;
++			drifted = true;
++		}
++		if (want_w != 0 && want_h != 0 &&
++			(m_screenWidth != want_w || m_screenHeight != want_h))
++			drifted = true;
++
++		if (drifted && want_w != 0 && want_h != 0) {
++			char m[256];
++			snprintf(m, sizeof(m),
++				"gliden64 resync: aspect->%d screen=%ux%u->%ux%u buf=%ux%u "
++				"adjust=%d scale=%.4f",
++				want_a, m_screenWidth, m_screenHeight, want_w, want_h,
++				m_width, m_height, m_bAdjustScreen ? 1 : 0, m_adjustScale);
++			gliden64_geom_beacon(m);
++			/* resizeWindow() (VI.cpp, next VI update) re-runs _resizeWindow() ->
++			 * _setBufferSize() and re-inits the drawer with the new geometry. */
++			m_resizeWidth = want_w;
++			m_resizeHeight = want_h;
++			m_bResizeWindow = true;
++		}
++	}
++
++	/* 0048: the geometry AT DRAW TIME. Every previous round beaconed it at
++	 * content load only, which is why three device logs read correct while the
++	 * picture was wrong. Twice per process, well clear of boot. */
++	{
++		static u32 swaps = 0;
++		++swaps;
++		if (swaps == 240 || swaps == 1200) {
++			char m[256];
++			snprintf(m, sizeof(m),
++				"gliden64 live: swap=%u aspect=%d adjust=%d scale=%.4f "
++				"screen=%ux%u buf=%ux%u scaleXY=%.3f/%.3f",
++				swaps, (int)config.frameBufferEmulation.aspect,
++				m_bAdjustScreen ? 1 : 0, m_adjustScale,
++				m_screenWidth, m_screenHeight, m_width, m_height,
++				m_scaleX, m_scaleY);
++			gliden64_geom_beacon(m);
++		}
++	}
+ 	//Don't let the command queue grow too big buy waiting on no more swap buffers being queued
+ 	if(!netplay_lag())

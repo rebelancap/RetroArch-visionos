@@ -1,0 +1,15 @@
+diff --git a/libretro-common/include/compat/apple_compat.h b/libretro-common/include/compat/apple_compat.h
+index 18796d4..fac7399 100644
+--- a/libretro-common/include/compat/apple_compat.h
++++ b/libretro-common/include/compat/apple_compat.h
+@@ -71,7 +71,9 @@ NS_INLINE CF_RETURNS_RETAINED CFTypeRef CFBridgingRetainCompat(id X)
+ 
+ #ifdef __OBJC__
+ #import <UIKit/UIKit.h>
+-#import <GLKit/GLKit.h>
++#if !TARGET_OS_VISION
++#import <GLKit/GLKit.h> /* GLKit (and OpenGL ES) do not exist on visionOS */
++#endif
+ #import <Foundation/Foundation.h>
+ #endif
+ 

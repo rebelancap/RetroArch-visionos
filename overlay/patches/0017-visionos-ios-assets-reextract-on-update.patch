@@ -1,0 +1,18 @@
+diff --git a/frontend/drivers/platform_darwin.m b/frontend/drivers/platform_darwin.m
+index 9aaf783..6a7e661 100644
+--- a/frontend/drivers/platform_darwin.m
++++ b/frontend/drivers/platform_darwin.m
+@@ -546,7 +546,12 @@ static void frontend_darwin_get_env(int *argc, char *argv[],
+              application_data
+        );
+        NSString *bundleVersionString = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"];
+-       NSInteger bundleVersion = [bundleVersionString integerValue] || 1;
++       /* Upstream wrote `integerValue || 1`, which is logical-OR: it is ALWAYS 1,
++        * so version_current never changes and assets.zip extracts only once ever
++        * (first launch) and NEVER on an app update — stale bundled info/databases
++        * can't reach an updated install. `?:` uses the real CFBundleVersion (a
++        * monotonic integer set per build), so bumping it re-extracts on update. */
++       NSInteger bundleVersion = [bundleVersionString integerValue] ?: 1;
+        configuration_set_uint(settings, settings->uints.bundle_assets_extract_version_current, (uint)bundleVersion);
+     }
+ 

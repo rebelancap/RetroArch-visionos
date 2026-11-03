@@ -1,0 +1,62 @@
+diff --git a/cores/mupen64plus-next/custom/mupen64plus-core/api/config.c b/cores/mupen64plus-next/custom/mupen64plus-core/api/config.c
+--- a/cores/mupen64plus-next/custom/mupen64plus-core/api/config.c
++++ b/cores/mupen64plus-next/custom/mupen64plus-core/api/config.c
+@@ -1309,7 +1309,27 @@
+   return "";
+ }
+ 
++/* 0037: the libretro build stubbed this to "", so GLideN64's shader storage
++ * built the path "/shaders/GLideN64.<romhash>.GLES.shaders", osal_mkdirp("/shaders")
++ * failed on the read-only root, the fallback "/GLideN64.…" failed too, and NOTHING
++ * was ever written — the level-load shader compiles were cold every single launch.
++ * Hand it the libretro system directory instead (frontend-provided, writable, the
++ * same place cores keep BIOS/cache); glsl_ShaderStorage appends "/shaders" and
++ * mkdirp's it. Measured defect: */
++extern const char * retro_get_system_directory(void);
++
+ EXPORT const char * CALL ConfigGetUserCachePath(void)
+ {
+-  return "";
++  static char s_cache_path[1024];
++  const char *dir;
++
++  if (s_cache_path[0] != '\0')
++    return s_cache_path;
++
++  dir = retro_get_system_directory();
++  if (!dir || dir[0] == '\0')
++    return "";
++
++  snprintf(s_cache_path, sizeof(s_cache_path), "%s", dir);
++  return s_cache_path;
+ }
+diff --git a/cores/mupen64plus-next/GLideN64/src/Combiner.cpp b/cores/mupen64plus-next/GLideN64/src/Combiner.cpp
+--- a/cores/mupen64plus-next/GLideN64/src/Combiner.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/Combiner.cpp
+@@ -1,4 +1,5 @@
+ #include <fstream>
++#include <chrono>
+ #include <functional>
+ #include <cstring>
+ #include <stdio.h>
+@@ -302,6 +303,20 @@
+ 		m_pCurrent = Combiner_Compile(key);
+ 		m_pCurrent->update(true);
+ 		m_combiners[m_pCurrent->getKey()] = m_pCurrent;
++		/* 0037: persist incrementally. Upstream only saves from
++		 * CombinerInfo::destroy(), i.e. at core unload — which a swipe-kill on
++		 * iOS/visionOS never reaches, so a session's compiled shaders were always
++		 * lost. Save after a NEW combiner is compiled, throttled to one write per
++		 * 5 s so a scene that compiles dozens in a burst writes once. Same guard
++		 * as destroy()'s call. */
++		if (config.generalEmulation.enableShadersStorage != 0) {
++			static std::chrono::steady_clock::time_point s_lastShaderSave;
++			const auto now = std::chrono::steady_clock::now();
++			if (now - s_lastShaderSave >= std::chrono::seconds(5)) {
++				s_lastShaderSave = now;
++				_saveShadersStorage();
++			}
++		}
+ 	}
+ 	m_bChanged = true;
+ }

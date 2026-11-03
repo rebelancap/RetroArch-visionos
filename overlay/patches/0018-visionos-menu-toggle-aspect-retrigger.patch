@@ -1,0 +1,29 @@
+diff --git a/menu/menu_driver.c b/menu/menu_driver.c
+index c47122d..75fa03e 100644
+--- a/menu/menu_driver.c
++++ b/menu/menu_driver.c
+@@ -6608,6 +6608,12 @@ void retroarch_menu_running(void)
+    if (input_overlay_hide_in_menu)
+       command_event(CMD_EVENT_OVERLAY_UNLOAD, NULL);
+ #endif
++#if defined(RA_VISIONOS)
++   /* overlay 0018: the aspect funnel is not otherwise called on menu toggle, so
++    * re-fire it now that MENU_ST_FLAG_ALIVE is set — video_driver_set_aspect_ratio
++    * will shape the window to a neutral landscape for the (aspect-agnostic) menu. */
++   command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
++#endif
+ }
+ 
+ void retroarch_menu_running_finished(bool quit)
+@@ -6703,6 +6709,11 @@ void retroarch_menu_running_finished(bool quit)
+       if (settings && settings->bools.input_overlay_hide_in_menu)
+          input_overlay_init();
+ #endif
++#if defined(RA_VISIONOS)
++   /* overlay 0018: menu closed — re-fire the aspect funnel so the window snaps
++    * back from the neutral menu shape to the running game's aspect. */
++   command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
++#endif
+ }
+ 
+ #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)

@@ -1,0 +1,33 @@
+diff --git a/pkg/apple/RetroArchWidgetExtension/RetroArchWidgetExtension.swift b/pkg/apple/RetroArchWidgetExtension/RetroArchWidgetExtension.swift
+index 903ad02..ed3ef75 100644
+--- a/pkg/apple/RetroArchWidgetExtension/RetroArchWidgetExtension.swift
++++ b/pkg/apple/RetroArchWidgetExtension/RetroArchWidgetExtension.swift
+@@ -61,6 +61,11 @@ struct RetroArchWidgetExtension: Widget {
+     let kind: String = "RetroArchWidgetExtension"
+ 
+     var body: some WidgetConfiguration {
++#if os(visionOS)
++       // visionOS has no lock-screen accessory widget families (.accessoryCircular
++       // is unavailable); RetroArch ships no widget on visionOS. RA_VISIONOS.
++       return EmptyWidgetConfiguration()
++#else
+        if #available(iOSApplicationExtension 16.0, *) {
+           return StaticConfiguration(kind: kind, provider: DummyProvider()) { _ in
+              RetroArchImageView()
+@@ -71,11 +76,16 @@ struct RetroArchWidgetExtension: Widget {
+        } else {
+           return EmptyWidgetConfiguration()
+        }
++#endif
+     }
+ }
+ 
+ struct RetroArchWidgetExtension_Previews: PreviewProvider {
+     static var previews: some View {
++#if os(visionOS)
++       RetroArchImageView()
++#else
+        RetroArchImageView()           .previewContext(WidgetPreviewContext(family: .accessoryCircular))
++#endif
+     }
+ }

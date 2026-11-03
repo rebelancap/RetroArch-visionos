@@ -1,0 +1,31 @@
+diff --git a/ui/drivers/cocoa/AppleTranslateBackend.swift b/ui/drivers/cocoa/AppleTranslateBackend.swift
+index e8c1fa2..76dfe1b 100644
+--- a/ui/drivers/cocoa/AppleTranslateBackend.swift
++++ b/ui/drivers/cocoa/AppleTranslateBackend.swift
+@@ -38,7 +38,7 @@ private func logTranslation(_ message: String) {
+ 
+ // MARK: - Translation Manager (SwiftUI-based)
+ 
+-#if canImport(Translation) && !os(tvOS)
++#if canImport(Translation) && !os(tvOS) && !os(visionOS)
+ @available(macOS 15.0, iOS 18.0, *)
+ @MainActor
+ private class TranslationManager {
+@@ -744,7 +744,7 @@ public func appleTranslateInit() -> Bool {
+ 
+ @_cdecl("apple_translate_can_translate")
+ public func appleTranslateCanTranslate() -> Bool {
+-    #if canImport(Translation) && !os(tvOS)
++    #if canImport(Translation) && !os(tvOS) && !os(visionOS)
+     if #available(macOS 15.0, iOS 18.0, *) {
+         return true
+     }
+@@ -921,7 +921,7 @@ public func appleTranslateImage(
+         // Step 2: Translate if needed
+         if let target = targetLanguage, sourceLanguage != target {
+             logTranslation("[Translation] Translating \(sourceLanguage ?? "auto") -> \(target)")
+-            #if canImport(Translation) && !os(tvOS)
++            #if canImport(Translation) && !os(tvOS) && !os(visionOS)
+             if #available(macOS 15.0, iOS 18.0, *) {
+                 Task { @MainActor in
+                     // Translate all blocks sequentially

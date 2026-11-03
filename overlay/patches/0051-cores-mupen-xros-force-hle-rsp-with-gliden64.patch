@@ -1,0 +1,34 @@
+diff --git a/cores/mupen64plus-next/libretro/libretro.c b/cores/mupen64plus-next/libretro/libretro.c
+--- a/cores/mupen64plus-next/libretro/libretro.c
++++ b/cores/mupen64plus-next/libretro/libretro.c
+@@ -1011,9 +1011,30 @@
+              log_cb(RETRO_LOG_INFO, "Selected Parallel RSP without JIT, falling back to GLideN64!\n");
+              plugin_connect_rsp_api(RSP_PLUGIN_HLE);
+              plugin_connect_rdp_api(RDP_PLUGIN_GLIDEN64);
+ #endif
+           }
+        }
+ #endif
++
++#if defined(MUPEN_VK_DEFAULT)
++       /* 0051 (visionOS only): GLideN64 is an HLE graphics plugin. Driven by an
++        * LLE RSP (cxd4) its own display-list state is never filled in —
++        * gSP.viewport stays {0,0,0,0} for the whole session — and
++        * _needAdjustCoordinate() then crops every frame to the centre 75 % in
++        * "16:9 adjusted" (0050 hardens GLideN64 against it too). The
++        * xros slice defaults rsp-plugin to cxd4 (overlay 0016) to pair with the
++        * *software* RDP, and that default is persisted in the device's
++        * Mupen64Plus-Next.opt, so it has to be FORCED here rather than changed.
++        * Upstream already encodes the mirror-image rule above (hle + angrylion
++        * -> force an LLE RSP); this is the converse it never wrote. Also worth
++        * 4.017 -> 2.736 ms of retro_run on the mac harness at the device's
++        * settings. Runs last, after upstream's own JIT fallback, so it catches
++        * every route to an LLE RSP. */
++       if (current_rdp_type == RDP_PLUGIN_GLIDEN64 && current_rsp_type != RSP_PLUGIN_HLE)
++       {
++          log_cb(RETRO_LOG_INFO, "GLideN64 needs the HLE RSP; overriding the selected RSP plugin.\n");
++          plugin_connect_rsp_api(RSP_PLUGIN_HLE);
++       }
++#endif
+ 
+        var.key = CORE_NAME "-ThreadedRenderer";

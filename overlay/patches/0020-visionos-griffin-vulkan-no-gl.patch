@@ -1,0 +1,16 @@
+diff --git a/griffin/griffin.c b/griffin/griffin.c
+index e9f56ae..544b21e 100644
+--- a/griffin/griffin.c
++++ b/griffin/griffin.c
+@@ -285,7 +285,10 @@ VIDEO CONTEXT
+ ============================================================ */
+ #include "../gfx/drivers_context/gfx_null_ctx.c"
+ 
+-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_VULKAN) || defined(HAVE_OPENGLES) || defined(HAVE_OPENGL_CORE)
++/* overlay 0020: on visionOS HAVE_VULKAN is set (MoltenVK) but there is no GL —
++ * gate gl_common (which pulls <glsym/glsym.h>, GL/GLES headers absent on xros)
++ * off the Vulkan-only build. */
++#if defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || (defined(HAVE_VULKAN) && !defined(RA_VISIONOS)) || defined(HAVE_OPENGLES) || defined(HAVE_OPENGL_CORE)
+ #include "../gfx/common/gl_common.c"
+ #endif
+ 

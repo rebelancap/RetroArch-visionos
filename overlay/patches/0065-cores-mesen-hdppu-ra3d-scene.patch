@@ -1,0 +1,51 @@
+diff --git a/cores/mesen/Core/HdPpu.cpp b/cores/mesen/Core/HdPpu.cpp
+--- a/cores/mesen/Core/HdPpu.cpp
++++ b/cores/mesen/Core/HdPpu.cpp
+@@ -11,7 +11,26 @@
+ void HdPpu::DrawPixel()
+ {
+-	uint16_t bufferOffset = (_scanline << 8) + _cycle - 1;
+-	uint16_t &pixel = _currentOutputBuffer[bufferOffset];
+-	_lastSprite = nullptr;
++	uint16_t bufferOffset = (_scanline << 8) + _cycle - 1;
++	uint16_t &pixel = _currentOutputBuffer[bufferOffset];
++	_lastSprite = nullptr;
++
++	/* 0065: RA3D scene stream — the block PPU::DrawPixel() carries (overlay
++	 * 0059).  This override would otherwise skip it entirely, so with an HD
++	 * pack loaded the 3dSen shape mode saw an empty scene forever. */
++	if(_ra3dSceneEnabled && IsRenderingEnabled()) {
++		uint8_t fineX = _state.XScroll;
++		int32_t x = (int32_t)_cycle - 1;
++		const TileInfo &tile = ((fineX + (((uint32_t)x) & 0x07)) < 8) ? _previousTile : _currentTile;
++		if(x == 0) {
++			int32_t originY = _scanline - (int32_t)tile.OffsetY;
++			_ra3dSceneRowActive = (originY != _ra3dSceneRowY);
++			if(_ra3dSceneRowActive) {
++				_ra3dSceneRowY = originY;
++				Ra3dSceneCaptureBgTile(tile, -(int32_t)fineX, originY);
++			}
++		} else if(_ra3dSceneRowActive && ((fineX + (uint32_t)x) & 0x07) == 0) {
++			Ra3dSceneCaptureBgTile(tile, x, _scanline - (int32_t)tile.OffsetY);
++		}
++	}
+ 
+ 	if(IsRenderingEnabled() || ((_state.VideoRamAddr & 0x3F00) != 0x3F00)) {
+@@ -160,6 +160,15 @@
+ void HdPpu::SendFrame()
+ {
+-	_info->FrameNumber = _frameCount;
+-	_info->WatchedAddressValues.clear();
++	/* 0065: RA3D scene stream — the sprite read-out and publish from
++	 * PPU::SendFrame() (overlay 0059), which this override skips.  At the top
++	 * rather than the bottom because 0057's hunk owns the tail of this
++	 * function; see gen-patch-0065.py for why that is behaviourally free. */
++	if(_ra3dSceneEnabled) {
++		Ra3dSceneCaptureSprites();
++		Ra3dScenePublish();
++	}
++
++	_info->FrameNumber = _frameCount;
++	_info->WatchedAddressValues.clear();
+ 	for(uint32_t address : _hdData->WatchedMemoryAddresses) {
+ 		if(address & HdPackBaseMemoryCondition::PpuMemoryMarker) {

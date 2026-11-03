@@ -1,0 +1,192 @@
+diff --git a/cores/snes9x/gfx.cpp b/cores/snes9x/gfx.cpp
+index 98f9941..499a089 100644
+--- a/cores/snes9x/gfx.cpp
++++ b/cores/snes9x/gfx.cpp
+@@ -23,6 +23,14 @@ void S9xComputeClipWindows (void);
+ void (*S9xCustomDisplayString) (const char *, int, int, bool, int) = NULL;
+ 
+ static void SetupOBJ (void);
++/* ---- RA3D depth planes (consumed by the visionOS shell via dlsym) ----------
++ * Two planes for SNES: everything-but-sprites, and sprites alone. */
++uint16  *ra3d_bg_screen = NULL;
++uint8   *ra3d_bg_zbuf   = NULL;
++uint32  *ra3d_argb[2]   = { NULL, NULL };
++uint32   ra3d_frame     = 0;
++bool8    ra3d_have      = FALSE;
++
+ static void DrawOBJS (int);
+ static void DisplayTime (void);
+ static void DisplayFrameRate (void);
+@@ -60,6 +68,17 @@ bool8 S9xGraphicsInit (void)
+ 	GFX.ZBuffer    = (uint8 *)  malloc(GFX.ScreenSize);
+ 	GFX.SubZBuffer = (uint8 *)  malloc(GFX.ScreenSize);
+ 
++	/* RA3D: buffers for a second main-screen render with sprites masked off, so
++	 * the shell gets a background plane with no sprite-shaped holes.  Unlike the
++	 * NES, snes9x never computes the pixel underneath a sprite — OBJ composites
++	 * first and the Z test drops whatever loses — so the only way to recover the
++	 * covered background is to render the scanline again without OBJ.  Costs one
++	 * more rasterization pass; no extra emulation. */
++	ra3d_bg_screen = (uint16 *) malloc(GFX.ScreenSize * sizeof(uint16));
++	ra3d_bg_zbuf   = (uint8 *)  malloc(GFX.ScreenSize);
++	ra3d_argb[0]   = (uint32 *) malloc(GFX.ScreenSize * sizeof(uint32));
++	ra3d_argb[1]   = (uint32 *) malloc(GFX.ScreenSize * sizeof(uint32));
++
+ 	if (!GFX.ZERO || !GFX.SubScreen || !GFX.ZBuffer || !GFX.SubZBuffer)
+ 	{
+ 		S9xGraphicsDeinit();
+@@ -468,6 +487,23 @@ void S9xUpdateScreen (void)
+ 					*q = *(q + 1) = *p;
+ 			}
+ 
++			/* RA3D: the same widening on our OBJ-free buffer.  When a frame
++			 * switches to hi-res partway down, the rows already rendered are
++			 * re-spread from 256 to 512 across.  Missing that here leaves every
++			 * earlier row in our buffer at the old stride, and the background
++			 * plane comes out as garbage for that frame. */
++			if (ra3d_bg_screen)
++			{
++				for (uint32 y = 0; y < GFX.StartY; y++)
++				{
++					uint16	*p = ra3d_bg_screen + y * GFX.PPL + 255;
++					uint16	*q = ra3d_bg_screen + y * GFX.PPL + 510;
++
++					for (int x = 255; x >= 0; x--, p--, q -= 2)
++						*q = *(q + 1) = *p;
++				}
++			}
++
+ 			IPPU.DoubleWidthPixels = TRUE;
+ 			IPPU.RenderedScreenWidth = 512;
+ 		}
+@@ -481,6 +517,11 @@ void S9xUpdateScreen (void)
+ 
+ 			for (int32 y = (int32) GFX.StartY - 2; y >= 0; y--)
+ 				memmove(GFX.Screen + (y + 1) * GFX.PPL, GFX.Screen + y * GFX.RealPPL, GFX.PPL * sizeof(uint16));
++
++			/* RA3D: mirror the interlace row shuffle for the same reason. */
++			if (ra3d_bg_screen)
++				for (int32 y = (int32) GFX.StartY - 2; y >= 0; y--)
++					memmove(ra3d_bg_screen + (y + 1) * GFX.PPL, ra3d_bg_screen + y * GFX.RealPPL, GFX.PPL * sizeof(uint16));
+ 		}
+ 
+ 		if ((Memory.FillRAM[0x2130] & 0x30) != 0x30 && (Memory.FillRAM[0x2131] & 0x3f))
+@@ -493,6 +534,30 @@ void S9xUpdateScreen (void)
+ 			RenderScreen(TRUE);
+ 
+ 		RenderScreen(FALSE);
++
++		/* RA3D: the same scanlines again with OBJ masked out, into our own
++		 * screen and Z buffers.  Swap the pointers RenderScreen reads, force
++		 * the OBJ enable bit off, render, restore.  Nothing else can observe
++		 * this — the normal composite is already finished for these lines. */
++		if (ra3d_bg_screen && ra3d_bg_zbuf)
++		{
++			uint16 *saveScreen = GFX.Screen;
++			uint8  *saveZ      = GFX.ZBuffer;
++			uint8   saveForced = Settings.BG_Forced;
++
++			GFX.Screen         = ra3d_bg_screen;
++			GFX.ZBuffer        = ra3d_bg_zbuf;
++			Settings.BG_Forced = saveForced | 0x10;   /* 0x10 = OBJ layer */
++			for (uint32 l = GFX.StartY; l <= GFX.EndY; l++)
++				memset(ra3d_bg_zbuf + l * GFX.RealPPL, 0, GFX.RealPPL);
++
++			RenderScreen(FALSE);
++
++			Settings.BG_Forced = saveForced;
++			GFX.ZBuffer        = saveZ;
++			GFX.Screen         = saveScreen;
++			ra3d_have          = TRUE;
++		}
+ 	}
+ 	else
+ 	{
+diff --git a/cores/snes9x/libretro/libretro.cpp b/cores/snes9x/libretro/libretro.cpp
+index d381c61..a211682 100644
+--- a/cores/snes9x/libretro/libretro.cpp
++++ b/cores/snes9x/libretro/libretro.cpp
+@@ -1976,6 +1976,83 @@ static void report_buttons()
+     }
+ }
+ 
++/* ---- RA3D depth planes ------------------------------------------------------
++ * The visionOS shell places the picture's layers at different distances so the
++ * scene has real binocular depth.  It reads them straight out of the core by
++ * dlsym, so RetroArch's video path — and therefore ordinary 2D output — is
++ * untouched.
++ *
++ * SNES gives two planes rather than the NES's three: snes9x has no per-sprite
++ * "behind the background" bit exposed at this level, and the OBJ layer is
++ * composited as one unit.  Planes come back far to near:
++ *   planes[0] = everything except sprites  (from the OBJ-free second pass)
++ *   planes[1] = sprites alone              (where the normal composite differs)
++ * 256x239 ARGB8888, alpha 0 where nothing was drawn, owned by the core. */
++extern uint16 *ra3d_bg_screen;
++extern uint8  *ra3d_bg_zbuf;
++extern uint32 *ra3d_argb[2];
++extern uint32  ra3d_frame;
++extern bool8   ra3d_have;
++
++extern "C" int snes9x_ra3d_get_planes(const uint32_t **planes, unsigned *width,
++                                      unsigned *height, uint32_t *frame_counter,
++                                      float *display_aspect)
++{
++   if (!planes || !ra3d_have || !ra3d_argb[0] || !ra3d_argb[1] || !ra3d_bg_screen)
++      return 0;
++
++   /* Use the RENDERED size, not the nominal 256x224: in hi-res / pseudo-hires
++    * (mode 5/6, and plenty of title screens) snes9x renders 512 wide, and in
++    * interlace 448 tall.  Assuming 256 there takes the left half of every row
++    * and the picture comes out zoomed and cropped. */
++   const unsigned w = (unsigned)IPPU.RenderedScreenWidth;
++   const unsigned h = (unsigned)IPPU.RenderedScreenHeight;
++   if (w == 0 || h == 0 || w > MAX_SNES_WIDTH || h > MAX_SNES_HEIGHT)
++      return 0;
++
++   for (unsigned y = 0; y < h; y++)
++   {
++      const uint16 *comp = GFX.Screen        + y * GFX.RealPPL;  /* with sprites    */
++      const uint16 *bg   = ra3d_bg_screen    + y * GFX.RealPPL;  /* without sprites */
++      uint32       *o0   = ra3d_argb[0]      + y * w;
++      uint32       *o1   = ra3d_argb[1]      + y * w;
++      for (unsigned x = 0; x < w; x++)
++      {
++         /* 5-6-5 (or 5-5-5) to 8-8-8, replicating the high bits into the low
++          * ones so full-scale stays full-scale. */
++         /* Use snes9x's own unpacker rather than hand-rolled shifts: its 565
++          * layout is not the conventional one (green sits at shift 6), and
++          * getting it wrong tints the whole plane green. */
++         #define RA3D_TO_ARGB(px, out) do { \
++            uint8 _r, _g, _b; \
++            DECOMPOSE_PIXEL((px), _r, _g, _b); \
++            (out) = 0xFF000000u \
++                  | ((uint32)(_r * 255 / MAX_RED)   << 16) \
++                  | ((uint32)(_g * 255 / MAX_GREEN) <<  8) \
++                  |  (uint32)(_b * 255 / MAX_BLUE); \
++         } while (0)
++         uint16 c = comp[x], b = bg[x];
++         RA3D_TO_ARGB(b, o0[x]);
++         /* A sprite owns this pixel exactly where the two passes disagree. */
++         if (c != b) RA3D_TO_ARGB(c, o1[x]); else o1[x] = 0u;
++         #undef RA3D_TO_ARGB
++      }
++   }
++
++   planes[0] = ra3d_argb[0];
++   planes[1] = ra3d_argb[1];
++   if (width)  *width  = w;
++   if (height) *height = h;
++   if (frame_counter) *frame_counter = ++ra3d_frame;
++   /* The SNES displays 4:3 whether it rendered 256 or 512 across — hi-res
++    * doubles the sample count, not the picture's shape.  Report that directly
++    * so the shell never has to infer it from the plane dimensions or from the
++    * frontend's own aspect, which follows the rendered width and swings to
++    * ~2.28 in hi-res scenes. */
++   if (display_aspect) *display_aspect = 4.0f / 3.0f;
++   return 2;
++}
++
+ void retro_run()
+ {
+     static uint16 height = PPU.ScreenHeight;

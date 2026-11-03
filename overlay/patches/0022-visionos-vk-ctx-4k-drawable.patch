@@ -1,0 +1,38 @@
+diff --git a/gfx/drivers_context/cocoa_vk_ctx.m b/gfx/drivers_context/cocoa_vk_ctx.m
+index c5ec920..e52c853 100755
+--- a/gfx/drivers_context/cocoa_vk_ctx.m
++++ b/gfx/drivers_context/cocoa_vk_ctx.m
+@@ -161,10 +161,29 @@ static void cocoa_vk_gfx_ctx_get_video_size(void *data,
+       unsigned* width, unsigned* height)
+ {
+     UIView *renderView              = apple_platform.renderView;
+-    CGRect size                     = [renderView bounds];
+-    float viewScale                 = [renderView contentScaleFactor];
+-    *width                          = CGRectGetWidth(size)  * viewScale;
+-    *height                         = CGRectGetHeight(size) * viewScale;
++#if TARGET_OS_VISION
++    /* Report the CAMetalLayer's actual drawableSize (set to ~4K by
++     * cocoa_vision_update_drawable) rather than bounds x contentScaleFactor —
++     * contentScaleFactor is capped ~2x on visionOS, which would size the swapchain
++     * (and thus the menu) at ~2x. Publishing the 4K size makes RA recreate the
++     * swapchain at currentExtent = drawableSize. */
++    if ([renderView isKindOfClass:[MetalLayerView class]])
++    {
++        CGSize d = ((MetalLayerView *)renderView).metalLayer.drawableSize;
++        if (d.width >= 1.0 && d.height >= 1.0)
++        {
++            *width  = (unsigned)d.width;
++            *height = (unsigned)d.height;
++            return;
++        }
++    }
++#endif
++    {
++        CGRect size                 = [renderView bounds];
++        float viewScale             = [renderView contentScaleFactor];
++        *width                      = CGRectGetWidth(size)  * viewScale;
++        *height                     = CGRectGetHeight(size) * viewScale;
++    }
+ }
+ #endif
+ 

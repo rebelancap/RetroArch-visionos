@@ -1,0 +1,202 @@
+diff --git a/input/drivers_joypad/mfi_joypad.m b/input/drivers_joypad/mfi_joypad.m
+--- a/input/drivers_joypad/mfi_joypad.m
++++ b/input/drivers_joypad/mfi_joypad.m
+@@ -491,6 +491,119 @@
+         mfi_rumblers[controller.playerIndex] = [[MFIRumbleController alloc] initWithController:controller];
+ }
+ 
++#if TARGET_OS_VISION
++/* --- 0054: deterministic controller slot policy + enumeration beacon --------
++ * See scripts/gen-patch-0054.py for the whole reasoning. visionOS only; the
++ * iOS/tvOS builds compile exactly upstream's code. */
++#include <stdarg.h>
++
++extern void RA_BeaconMark(const char *stage);
++
++static void apple_gamecontroller_joypad_disconnect(GCController *controller);
++
++static void mfi_beacon(const char *fmt, ...)
++{
++   char    msg[512];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(msg, sizeof(msg), fmt, ap);
++   va_end(ap);
++   RARCH_LOG("[MFI] %s\n", msg);
++   RA_BeaconMark(msg);
++}
++
++static const char *mfi_display_name(GCController *c)
++{
++   const char *s;
++   if (!c)
++      return "-";
++   if (!c.vendorName)
++      return "(unnamed)";
++   s = [c.vendorName UTF8String];
++   return s ? s : "(unnamed)";
++}
++
++/* A device that can actually drive an emulator: an extendedGamepad profile.
++ * Everything else that can turn up in [GCController controllers] on visionOS —
++ * a Siri-remote-style microGamepad, a keyboard/HID device coalesced into a
++ * controller, a system/spatial input device, or a physical pad's own secondary
++ * profile — is a ghost as far as port 1 is concerned. */
++static bool mfi_controller_is_gamepad(GCController *controller)
++{
++   if (!controller)
++      return false;
++   if (mfi_controller_is_siri_remote(controller))
++      return false;
++   return controller.extendedGamepad != nil;
++}
++
++static void mfi_beacon_roster(const char *when)
++{
++   char roster[400];
++   int  off = 0;
++   int  i;
++   roster[0] = '\0';
++   for (i = 0; i < MAX_MFI_CONTROLLERS; i++)
++   {
++      GCController *c = mfi_controllers[i];
++      int n = snprintf(roster + off, sizeof(roster) - (size_t)off,
++                       "%s%d=%s%s", i ? " " : "", i, mfi_display_name(c),
++                       (c && !mfi_controller_is_gamepad(c)) ? "[ghost]" : "");
++      if (n < 0 || off + n >= (int)sizeof(roster))
++         break;
++      off += n;
++   }
++   mfi_beacon("mfi roster (%s): %s", when, roster);
++}
++
++/* Pick the slot a GAMEPAD should occupy, evicting a ghost that is squatting
++ * below it. Returns -1 when every slot is held by a real gamepad. Ghosts never
++ * reach here — they are excluded at the top of the connect handler. */
++static int mfi_vision_pick_slot(GCController *controller)
++{
++   int i;
++   int slot = -1;
++
++   /* Lowest free slot, ignoring whatever playerIndex the system persisted for
++    * this controller. */
++   for (i = 0; i < MAX_MFI_CONTROLLERS; i++)
++      if (!mfi_controllers[i])
++      {
++         slot = i;
++         break;
++      }
++
++   /* ...and if a ghost is sitting below that, take its slot outright. */
++   for (i = 0; i < MAX_MFI_CONTROLLERS; i++)
++   {
++      GCController *occ = mfi_controllers[i];
++
++      if (!occ)
++         continue;                      /* free slot: already considered above */
++      if (slot >= 0 && i > slot)
++         break;                         /* nothing lower left to reclaim */
++      if (mfi_controller_is_gamepad(occ))
++         continue;                      /* a real pad keeps its slot */
++
++      /* Release slot i on the driver's own path (haptics teardown + autoconfig
++       * disconnect) and DROP the ghost: a device that cannot play must not
++       * occupy a core-visible port at all (Super Mario Kart offered only a 2P
++       * game while one did). */
++      apple_gamecontroller_joypad_disconnect(occ);
++      mfi_buttons[i] = 0;
++      memset(mfi_axes[i], 0, sizeof(mfi_axes[0]));
++      occ.playerIndex = GCControllerPlayerIndexUnset;
++      mfi_beacon("mfi evict: '%s' dropped from slot %d, a gamepad takes port %d",
++                 mfi_display_name(occ), i, i + 1);
++
++      slot = i;
++      break;
++   }
++
++   return slot;
++}
++#endif /* TARGET_OS_VISION */
++
+ static void apple_gamecontroller_joypad_connect(GCController *controller)
+ {
+     signed desired_index = (int32_t)controller.playerIndex;
+@@ -531,6 +644,58 @@
+         }
+     }
+ 
++#if TARGET_OS_VISION
++    /* 0054: name the device in the OTA-only log, then place it deterministically. */
++    {
++        const char *cat  = "(n/a)";
++        int         elem = 0;
++        int         slot;
++
++        if (@available(visionOS 1.0, *))
++        {
++            if (controller.productCategory)
++                cat = [controller.productCategory UTF8String];
++            elem = (int)controller.physicalInputProfile.elements.count;
++        }
++        mfi_beacon("mfi connect: name='%s' cat='%s' extended=%d micro=%d "
++                   "haptics=%d battery=%d motion=%d light=%d elements=%d "
++                   "incoming playerIndex=%d",
++                   mfi_display_name(controller), cat,
++                   controller.extendedGamepad != nil,
++                   controller.microGamepad != nil,
++                   controller.haptics != nil,
++                   controller.battery != nil,
++                   controller.motion != nil,
++                   controller.light != nil,
++                   elem, (int)controller.playerIndex);
++
++        /* A device with no extendedGamepad profile cannot play anything, and a
++         * core counts every connected port as a live player — Super Mario Kart
++         * offered the tester only a 2P game while one of these held port 2. Refuse
++         * it here, exactly as upstream refuses the Siri remote. */
++        if (!mfi_controller_is_gamepad(controller))
++        {
++            mfi_beacon("mfi exclude: '%s' has no extendedGamepad profile, "
++                       "not given a port", mfi_display_name(controller));
++            controller.playerIndex = GCControllerPlayerIndexUnset;
++            mfi_beacon_roster("after exclude");
++            return;
++        }
++
++        slot = mfi_vision_pick_slot(controller);
++        if (slot < 0)
++        {
++            mfi_beacon("mfi connect: '%s' REFUSED, all %d slots busy",
++                       mfi_display_name(controller), MAX_MFI_CONTROLLERS);
++            RARCH_ERR("[MFI] Too many connected controllers, ignoring.\n");
++            return;
++        }
++        mfi_beacon("mfi slot: '%s' -> slot %d (port %d), policy=gamepad:lowest-free",
++                   mfi_display_name(controller), slot, slot + 1);
++        desired_index = slot;
++    }
++#endif
++
+     if (mfi_controllers[desired_index] != controller)
+     {
+         /* Desired slot is unused, take it */
+@@ -568,11 +733,19 @@
+     apple_gamecontroller_joypad_register(controller);
+     apple_gamecontroller_joypad_setup_haptics(controller);
+     mfi_joypad_autodetect_add((unsigned)controller.playerIndex, [controller.vendorName cStringUsingEncoding:NSUTF8StringEncoding]);
++#if TARGET_OS_VISION
++    mfi_beacon_roster("after connect");
++#endif
+ }
+ 
+ static void apple_gamecontroller_joypad_disconnect(GCController* controller)
+ {
+     NSInteger pad = controller.playerIndex;
++
++#if TARGET_OS_VISION
++    mfi_beacon("mfi disconnect: name='%s' slot %d", mfi_display_name(controller),
++               (int)pad);
++#endif
+ 
+     if (pad < 0 || pad >= MAX_MFI_CONTROLLERS)
+         return;

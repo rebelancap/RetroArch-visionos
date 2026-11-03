@@ -1,0 +1,70 @@
+diff --git a/configuration.c b/configuration.c
+--- a/configuration.c
++++ b/configuration.c
+@@ -6521,11 +6521,61 @@
+          strlcpy(path_settings[i].ptr, tmp_str, PATH_MAX_LENGTH);
+    }
+ 
+-#if !IOS
+-   if (config_get_path(conf, "libretro_directory", tmp_str, sizeof(tmp_str)))
+-      configuration_set_string(settings,
+-            settings->paths.directory_libretro, tmp_str);
+-#endif
++#if !IOS
++   if (config_get_path(conf, "libretro_directory", tmp_str, sizeof(tmp_str)))
++      configuration_set_string(settings,
++            settings->paths.directory_libretro, tmp_str);
++#endif
++
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++   /* 0063 (the fix (d) specified): iOS/visionOS RELOCATE the data
++    * container on every install, retroarch.cfg persists directories as ABSOLUTE
++    * paths, and the loop above re-applies them blind. Upstream existence-checks
++    * screenshot_directory (below), savefile_directory and savestate_directory —
++    * so those self-heal — but NOT system_directory or playlist_directory, which
++    * then point one install behind, forever: dead BIOS lookups (flycast), dead
++    * HD-pack lookups (Mesen), an empty recent-content list.
++    *
++    * The same reason upstream ignores a saved libretro_directory on iOS, just
++    * above. Conservative on purpose: a path is healed ONLY when it names some
++    * app data container, is not under the LIVE one, and is not there any more —
++    * a user who deliberately pointed these elsewhere inside the live container
++    * keeps his choice, and a healthy config prints nothing. */
++#define RA_HEAL_DEAD_DIR(dirvar, defdir, ident) \
++   do \
++   { \
++      const char *ra_live = getenv("HOME"); \
++      const char *ra_def  = (defdir); \
++      if (     *(dirvar) \
++            && !string_is_equal((dirvar), "default") \
++            && strstr((dirvar), "/Containers/Data/Application/") \
++            && !(ra_live && !strncmp((dirvar), ra_live, strlen(ra_live))) \
++            && !path_is_directory((dirvar))) \
++      { \
++         char ra_msg[512]; \
++         extern void RA_BeaconMark(const char *); \
++         snprintf(ra_msg, sizeof(ra_msg), \
++               "config heal: \"%s\" pointed into a dead data container " \
++               "(\"%s\") -> \"%s\"", (ident), (dirvar), \
++               *ra_def ? ra_def : "(cleared)"); \
++         RARCH_WARN("[Config] %s\n", ra_msg); \
++         RA_BeaconMark(ra_msg); \
++         if (*ra_def) \
++         { \
++            configuration_set_string(settings, (dirvar), ra_def); \
++         } \
++         else \
++            *(dirvar) = '\0'; \
++      } \
++   } while (0)
++
++   RA_HEAL_DEAD_DIR(settings->paths.directory_system,
++         g_defaults.dirs[DEFAULT_DIR_SYSTEM],   "system_directory");
++   RA_HEAL_DEAD_DIR(settings->paths.directory_playlist,
++         g_defaults.dirs[DEFAULT_DIR_PLAYLIST], "playlist_directory");
++
++#undef RA_HEAL_DEAD_DIR
++#endif
+ 
+ #ifdef RARCH_CONSOLE
+    if (conf)

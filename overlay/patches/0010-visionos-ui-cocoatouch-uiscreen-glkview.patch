@@ -1,0 +1,646 @@
+diff --git a/ui/drivers/ui_cocoatouch.m b/ui/drivers/ui_cocoatouch.m
+index c22da74..fcf97ef 100644
+--- a/ui/drivers/ui_cocoatouch.m
++++ b/ui/drivers/ui_cocoatouch.m
+@@ -17,6 +17,7 @@
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <pthread.h>   /* pthread_getname_np/self/main_np — crash-handler thread id */
+ 
+ #include <boolean.h>
+ 
+@@ -28,6 +29,11 @@
+ 
+ #include "cocoa/cocoa_common.h"
+ #include "cocoa/apple_platform.h"
++
++#if defined(RA_VISION_3D)
++/* visionOS 3D theater shell (app/visionos/, on the header search path). */
++#include "RAVision.h"
++#endif
+ #ifdef HAVE_RETROARCH_PLAYLIST_MANAGER
+ #import "cocoa/RetroArchPlaylistManager.h"
+ #endif
+@@ -59,6 +65,7 @@
+ 
+ #ifdef HAVE_MENU
+ #include "../../menu/menu_setting.h"
++#include "../../menu/menu_driver.h"
+ #endif
+ 
+ #ifdef HAVE_NETWORKING
+@@ -116,7 +123,17 @@ static void ui_companion_cocoatouch_event_command(
+ #if TARGET_OS_TV
+          primary = iconfiles[@"CFBundlePrimaryIcon"];
+ #else
+-         primary = iconfiles[@"CFBundlePrimaryIcon"][@"CFBundleIconName"];
++         /* On visionOS the CFBundleIcons emitted for a .solidimagestack makes
++          * CFBundlePrimaryIcon a bare NAME string (like tvOS), not the iOS dict
++          * with CFBundleIconName — subscripting the string crashed at launch
++          * (unrecognized selector). Handle both shapes. */
++         id primaryIcon = iconfiles[@"CFBundlePrimaryIcon"];
++         if ([primaryIcon isKindOfClass:[NSDictionary class]])
++            primary = ((NSDictionary *)primaryIcon)[@"CFBundleIconName"];
++         else if ([primaryIcon isKindOfClass:[NSString class]])
++            primary = (NSString *)primaryIcon;
++         else
++            primary = nil;
+ #endif
+          list = string_list_new();
+          cstr = [primary cStringUsingEncoding:kCFStringEncodingUTF8];
+@@ -127,7 +144,13 @@ static void ui_companion_cocoatouch_event_command(
+ #if TARGET_OS_TV
+          alts = iconfiles[@"CFBundleAlternateIcons"];
+ #else
+-         alts = [iconfiles[@"CFBundleAlternateIcons"] allKeys];
++         id altIcons = iconfiles[@"CFBundleAlternateIcons"];
++         if ([altIcons isKindOfClass:[NSDictionary class]])
++            alts = [(NSDictionary *)altIcons allKeys];   /* iOS: dict of icon sets */
++         else if ([altIcons isKindOfClass:[NSArray class]])
++            alts = (NSArray *)altIcons;                   /* tvOS/visionOS: array of names */
++         else
++            alts = @[];
+ #endif
+          NSArray<NSString *> *sorted = [alts sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+          for (NSString *str in sorted)
+@@ -201,7 +224,11 @@ void get_ios_version(int *major, int *minor)
+ 
+ bool ios_running_on_ipad(void)
+ {
++#if TARGET_OS_VISION
++   return true; /* visionOS: iPad-class idiom (no UI_USER_INTERFACE_IDIOM) */
++#else
+    return (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
++#endif
+ }
+ 
+ /* Input helpers: This is kept here because it needs ObjC */
+@@ -532,6 +559,19 @@ - (void)setupMetalLayer {
+     self.metalLayer.opaque = YES;
+ }
+ 
++#if TARGET_OS_VISION
++/* Mirror MetalView (metal.m): the render view's OWN layoutSubviews is the
++ * can't-miss signal for a window/bounds change on visionOS. The Vulkan/ANGLE
++ * (N64) path renders onto THIS view, so re-derive its CAMetalLayer drawableSize
++ * here — the same fix that resolved the software cores' bars/squish, now for the
++ * MetalLayerView path (feeds the swapchain/EGL-surface size).. */
++- (void)layoutSubviews {
++    [super layoutSubviews];
++    extern void cocoa_vision_update_drawable(void);
++    cocoa_vision_update_drawable();
++}
++#endif
++
+ @end
+ #endif
+ 
+@@ -545,13 +585,242 @@ @interface RetroArch_iOS () <UITextFieldDelegate>
+  * is also accepted by the pre-ARC compiler - so the file remains
+  * buildable under MRR without a separate code path. */
+ @property (nonatomic, retain) UITextField *keyboardTextField;
++@property (nonatomic, retain) UIAlertController *keyboardAlert; /* visionOS text entry */
+ @property (nonatomic, copy) void(^keyboardCompletionCallback)(const char *);
+ @property (nonatomic, assign) char **keyboardBufferPtr;
+ @property (nonatomic, assign) size_t *keyboardSizePtr;
+ @property (nonatomic, assign) size_t *keyboardPtrPtr;
+ @property (nonatomic, assign) char *keyboardAllocatedBuffer;
++#if defined(RA_VISION_3D)
++/* visionOS 3D build: SwiftUI owns the scene, so -applicationDidFinishLaunching
++ * is a no-op and the real launch runs from here once the hosted view is inside
++ * a live window (RAVisionHost.m -> ra_vision_launch()). */
++- (void)raVisionLaunch:(UIApplication *)application;
++#endif
+ @end
+ 
++/* --- Remote-diagnosis floor -----
++ * Launch beacon + crash handler for OTA-only debugging: no debugger on the user's
++ * device, and RetroArch's own file log isn't up yet at launch. Writes to the app's
++ * Documents (Files-visible). Pure POSIX in the constructor (UIKit/Foundation are
++ * not safe pre-main). Always on and cheap; a crash at launch leaves crash.txt. */
++#include <fcntl.h>
++#include <time.h>
++#include <unistd.h>
++#include <execinfo.h>
++#include <signal.h>
++
++static void ra_diag_write(const char *file, const char *msg, int append)
++{
++   const char *home = getenv("HOME");
++   if (!home) return;
++   char path[1024];
++   snprintf(path, sizeof path, "%s/Documents/%s", home, file);
++   int fd = open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
++   if (fd < 0) return;
++   time_t t = time(NULL); struct tm tmv; localtime_r(&t, &tmv);
++   char line[640];
++   int n = snprintf(line, sizeof line, "%04d-%02d-%02d %02d:%02d:%02d  %s\n",
++      tmv.tm_year+1900, tmv.tm_mon+1, tmv.tm_mday,
++      tmv.tm_hour, tmv.tm_min, tmv.tm_sec, msg);
++   if (n > 0) write(fd, line, (size_t)n);
++   close(fd);
++}
++
++void RA_BeaconMark(const char *stage) { ra_diag_write("launch-beacon.log", stage, 1); }
++
++__attribute__((constructor)) static void ra_launch_beacon(void)
++{
++   ra_diag_write("launch-beacon.log", "beacon: dyld image init (pre-main) - process spawned", 1);
++}
++
++static void ra_crash_dump(const char *reason)
++{
++   ra_diag_write("crash.txt", reason, 1);
++   const char *home = getenv("HOME");
++   if (!home) return;
++   char path[1024];
++   snprintf(path, sizeof path, "%s/Documents/crash.txt", home);
++   int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
++   if (fd < 0) return;
++   void *cb[64];
++   int  n = backtrace(cb, 64);
++   backtrace_symbols_fd(cb, n, fd);
++   write(fd, "\n", 1);
++   close(fd);
++}
++
++static void ra_signal_handler(int sig)
++{
++   /* Include the crashing thread's name + main-thread flag: distinguishes a
++    * main-thread fault from a Granite/MoltenVK worker (e.g. the FPS-font-pinch
++    * SIGSEGV in a std::thread teardown). */
++   char tn[64] = {0};
++   pthread_getname_np(pthread_self(), tn, sizeof tn);
++   char msg[160]; snprintf(msg, sizeof msg, "CRASH: signal %d [thread='%s' main=%d]",
++      sig, tn[0] ? tn : "?", (int)pthread_main_np());
++   ra_crash_dump(msg);
++   signal(sig, SIG_DFL); raise(sig);
++}
++
++static void ra_exception_handler(NSException *e)
++{
++   char msg[512]; snprintf(msg, sizeof msg, "CRASH: uncaught %s: %s",
++      e.name.UTF8String ? e.name.UTF8String : "?",
++      e.reason.UTF8String ? e.reason.UTF8String : "?");
++   ra_crash_dump(msg);
++}
++
++static void ra_install_crash_handlers(void)
++{
++   NSSetUncaughtExceptionHandler(&ra_exception_handler);
++   int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP };
++   for (unsigned i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++)
++      signal(sigs[i], ra_signal_handler);
++}
++
++#if TARGET_OS_VISION
++/* --- visionOS window/drawable sizing (overlay patch 0015; WINDOW-ASPECT doc) ---
++ * cocoa_vision_update_drawable(): size the Metal drawable to a ~3840 long edge
++ * from the CURRENT view bounds (the patch 0010 formula), recomputed on every
++ * relayout so a resized / aspect-changed window keeps 4K fidelity.
++ * cocoa_vision_window_match_aspect(): request a window shaped to the applied
++ * content aspect so 4:3 content fills the plane with no pillarbox; user
++ * corner-drags stay ratio-locked. Called from video_driver_set_aspect_ratio(). */
++void cocoa_vision_update_drawable(void)
++{
++   UIView *rv = (UIView *)apple_platform.renderView;
++   if (!rv)
++      return;
++   CGFloat vw = rv.bounds.size.width, vh = rv.bounds.size.height;
++   if (MAX(vw, vh) < 1.0) { vw = 1280.0; vh = 720.0; }
++#if defined(RA_VISION_3D)
++   /* 3D theater: the render size is dictated by the panel, not by the parked
++    * control card's bounds.  Drive the MetalView's drawable straight to it so
++    * the driver's viewport and the offscreen ring always agree. */
++   if (ra_vision_3d_active() && [rv isKindOfClass:[MetalView class]])
++   {
++      unsigned tw = 0, th = 0;
++      ra_vision_3d_render_size(&tw, &th);
++      MetalView *mv3 = (MetalView *)rv;
++      CGSize     cur3 = mv3.drawableSize;
++      mv3.autoResizeDrawable = NO;
++      if (fabs(cur3.width - (CGFloat)tw) < 1.0 && fabs(cur3.height - (CGFloat)th) < 1.0)
++         return;
++      [mv3 setDrawableSize:CGSizeMake((CGFloat)tw, (CGFloat)th)];
++      { char _m[96]; snprintf(_m, sizeof _m, "visionOS 3D drawable %ux%u", tw, th);
++        RA_BeaconMark(_m); }
++      return;
++   }
++#endif
++   CGFloat scale = 3840.0 / MAX(vw, vh);
++   if (scale < 2.0) scale = 2.0;
++   CGSize dsz = CGSizeMake(vw * scale, vh * scale);
++   CGFloat dmax = MAX(dsz.width, dsz.height);
++   if (dmax > 4320.0) { CGFloat k = 4320.0 / dmax; dsz.width *= k; dsz.height *= k; }
++
++   /* Change-guard on both paths: this runs per-frame (rarch_draw_observer) and on
++    * every layout — only re-arm the drawable when the size actually changed. */
++   if ([rv isKindOfClass:[MetalView class]])              /* Metal cores */
++   {
++      MetalView *mv = (MetalView *)rv;
++      mv.autoResizeDrawable = NO;
++      CGSize cur = mv.drawableSize;
++      if (fabs(cur.width - dsz.width) < 1.0 && fabs(cur.height - dsz.height) < 1.0)
++         return;
++      [mv setDrawableSize:dsz];
++      { char _m[96]; snprintf(_m, sizeof _m, "visionOS drawable %.0fx%.0f (view pts %.0fx%.0f)",
++           dsz.width, dsz.height, vw, vh); RA_BeaconMark(_m); }
++   }
++#if defined(HAVE_VULKAN) || defined(HAVE_OPENGL)
++   else if ([rv isKindOfClass:[MetalLayerView class]])    /* N64: Vulkan OR ANGLE */
++   {
++      /* Both the Vulkan (ParaLLEl-RDP) and ANGLE (GLideN64) N64 paths render onto
++       * this MetalLayerView — but they take DIFFERENT size levers:
++       *   Vulkan: MoltenVK reads CAMetalLayer.drawableSize as the surface
++       *           currentExtent -> set drawableSize to ~4K.
++       *   ANGLE : SurfaceMtl derives drawable = bounds x contentsScale and REWRITES
++       *           drawableSize each present -> setting drawableSize is futile; drive
++       *           the layer's contentsScale instead (eglQuerySurface then reports 4K,
++       *           the round-4 reconcile handles the resize). */
++      CAMetalLayer *ml = ((MetalLayerView *)rv).metalLayer;
++      extern const char *video_driver_get_ident(void);
++      const char *vid = video_driver_get_ident();
++      bool is_gl = vid && vid[0] == 'g' && vid[1] == 'l';   /* gl/gles/glcore = ANGLE */
++      if (is_gl)
++      {
++         CGFloat le     = MAX(vw, vh);
++         CGFloat target = le > 1.0 ? (3840.0 / le) : 2.0;
++         if (target < 2.0) target = 2.0;                    /* never below system scale */
++         if (le * target > 4320.0) target = 4320.0 / le;    /* keep the 0010 cap */
++         if (fabs(ml.contentsScale - target) > 0.01)
++         {
++            ml.contentsScale = target;
++            char _m[96]; snprintf(_m, sizeof _m, "visionOS angle scale %.2f (view pts %.0fx%.0f)",
++                 target, vw, vh); RA_BeaconMark(_m);
++         }
++      }
++      else
++      {
++         CGSize cur = ml.drawableSize;
++         if (fabs(cur.width - dsz.width) < 1.0 && fabs(cur.height - dsz.height) < 1.0)
++            return;
++         ml.drawableSize = dsz;
++         char _m[96]; snprintf(_m, sizeof _m, "visionOS vk drawable %.0fx%.0f (view pts %.0fx%.0f)",
++              dsz.width, dsz.height, vw, vh); RA_BeaconMark(_m);
++      }
++   }
++#endif
++}
++
++void cocoa_vision_window_match_aspect(float aspect, unsigned rotation)
++{
++   if (aspect <= 0.0f)
++      return;
++#if defined(RA_VISION_3D)
++   /* In 3D theater the PANEL takes the content aspect, not the window: the
++    * screen keeps its user-set width and derives its height, so 4:3, NES 8:7
++    * and vertical arcade cabinets are each correctly shaped with no
++    * letterboxing — and the parked control card is left alone. */
++   ra_vision_3d_set_aspect(aspect, rotation);
++   if (ra_vision_3d_active())
++      return;
++#endif
++   if (rotation == 90 || rotation == 270)   /* vertical content (e.g. MAME shmup) */
++      aspect = 1.0f / aspect;
++   float a = aspect;
++   dispatch_async(dispatch_get_main_queue(), ^{
++      UIWindow *w       = [RetroArch_iOS get].window;
++      UIWindowScene *ws = w.windowScene;
++      if (!ws)
++         return;
++      CGFloat cw = w.bounds.size.width, ch = w.bounds.size.height;
++      CGFloat cur = (ch > 1.0) ? (cw / ch) : 0.0;
++      /* Compare the ACTUAL current window aspect (not a static) so we re-converge
++       * after a user corner-drag or an earlier request the system didn't honor.
++       * Skip only when the window already matches (within 2%). */
++      if (cur > 0.0f && fabsf(cur - a) < 0.02f) {
++         char _m[96]; snprintf(_m, sizeof _m, "aspect ok %.3f (win %.0fx%.0f)", a, cw, ch);
++         RA_BeaconMark(_m);
++         return;
++      }
++      CGFloat h = ch > 1.0 ? ch : 720.0;
++      UIWindowSceneGeometryPreferencesVision *p =
++         [[UIWindowSceneGeometryPreferencesVision alloc]
++            initWithSize:CGSizeMake(round(h * a), round(h))];
++      p.minimumSize          = CGSizeMake(320.0, 240.0);
++      p.resizingRestrictions = UIWindowSceneResizingRestrictionsUniform;
++      [ws requestGeometryUpdateWithPreferences:p errorHandler:^(NSError *e){
++         if (e) { char _m[160]; snprintf(_m, sizeof _m, "aspect geom ERROR: %s",
++              e.localizedDescription.UTF8String ? e.localizedDescription.UTF8String : "?");
++              RA_BeaconMark(_m); }
++      }];
++      char _m[112]; snprintf(_m, sizeof _m, "aspect req %.3f (cur %.3f, win %.0fx%.0f -> %.0fx%.0f)",
++           a, cur, cw, ch, round(h * a), round(h)); RA_BeaconMark(_m);
++   });
++}
++#endif
++
+ @implementation RetroArch_iOS
+ 
+ #pragma mark - ApplePlatform
+@@ -563,6 +832,14 @@ -(bool)hasFocus
+ 
+ - (void)setViewType:(apple_view_type_t)vt
+ {
++#if TARGET_OS_VISION
++   /* App-lifetime ANGLE render view (singleton) — see the OPENGL_ES case and
++    * recreating it per view-switch strands ANGLE's per-thread
++    * current context on a destroyed CAMetalLayer -> SIGSEGV on the next EGL
++    * call. Persist it so the EGL surface/context always have a live layer. */
++   static MetalLayerView *s_angleView = nil;
++   apple_view_type_t      old_vt      = _vt;
++#endif
+    if (vt == _vt)
+       return;
+ 
+@@ -606,13 +883,28 @@ - (void)setViewType:(apple_view_type_t)vt
+          break;
+ #endif
+        case APPLE_VIEW_TYPE_OPENGL_ES:
++#if TARGET_OS_VISION
++         /* visionOS: GLES comes from ANGLE (GLES3-over-Metal) rendering onto a
++          * CAMetalLayer.  Use an APP-LIFETIME SINGLETON view — recreating it
++          * per view-switch would strand ANGLE's per-thread current context on a
++          * destroyed CAMetalLayer and SIGSEGV the next EGL call.
++          * Byte-for-byte the ownership model of the glkit branch below: the
++          * static owns the singleton's +1; the ivar takes its own +1, balanced
++          * by the switch-away prologue's RARCH_RELEASE.  Switching away detaches
++          * (removeFromSuperview) but never destroys it — an offscreen
++          * CAMetalLayer keeps vending drawables, so ANGLE's surface stays live. */
++         if (!s_angleView)
++            s_angleView = [MetalLayerView new];
++         _renderView = RARCH_RETAIN(s_angleView);
++#else
+          /* glkitview_init() returns an unretained pointer to the
+           * cocoa_gl_ctx.m singleton.  Retain explicitly so _renderView
+           * matches the +1 invariant the Metal / Vulkan paths get from
+           * +new.  Under ARC RARCH_RETAIN is a no-op and the implicit
+           * __strong ivar assignment takes the retain via objc_storeStrong. */
+          _renderView = RARCH_RETAIN((BRIDGE GLKView*)glkitview_init());
+-         break;
++#endif
++         break; /* GLKit / OpenGL ES do not exist on visionOS — Metal only */
+ 
+        case APPLE_VIEW_TYPE_NONE:
+        default:
+@@ -643,6 +935,20 @@ - (void)setViewType:(apple_view_type_t)vt
+    [[_renderView.leadingAnchor constraintEqualToAnchor:rootView.leadingAnchor] setActive:YES];
+    [[_renderView.trailingAnchor constraintEqualToAnchor:rootView.trailingAnchor] setActive:YES];
+    [_renderView layoutIfNeeded];
++#if TARGET_OS_VISION
++   {
++      /* Black-box recorder for the ANGLE view lifecycle:
++       * every transition, with the resulting view + layer identity. */
++      CAMetalLayer *ml = [_renderView isKindOfClass:[MetalLayerView class]]
++                       ? ((MetalLayerView *)_renderView).metalLayer : nil;
++      char _m[176];
++      snprintf(_m, sizeof(_m),
++            "setViewType %d->%d view=%p layer=%p angle-singleton=%p",
++            (int)old_vt, (int)_vt, (__bridge void*)_renderView,
++            (__bridge void*)ml, (__bridge void*)s_angleView);
++      RA_BeaconMark(_m);
++   }
++#endif
+ }
+ 
+ - (apple_view_type_t)viewType { return _vt; }
+@@ -650,6 +956,11 @@ - (apple_view_type_t)viewType { return _vt; }
+ - (void)setVideoMode:(gfx_ctx_mode_t)mode
+ {
+ #ifdef HAVE_COCOA_METAL
++#if TARGET_OS_VISION
++   /* Drawable sizing lives in cocoa_vision_update_drawable() (patch 0015) so the
++    * same ~3840 formula runs from here AND from viewWillLayoutSubviews on resize. */
++   cocoa_vision_update_drawable();
++#else
+    MetalView *metalView = (MetalView*) _renderView;
+    CGFloat scale        = [[UIScreen mainScreen] scale];
+    [metalView setDrawableSize:CGSizeMake(
+@@ -657,6 +968,7 @@ - (void)setVideoMode:(gfx_ctx_mode_t)mode
+          _renderView.bounds.size.height * scale
+          )];
+ #endif
++#endif
+ }
+ 
+ - (void)setCursorVisible:(bool)v { /* no-op for iOS */ }
+@@ -675,7 +987,7 @@ -(NSString*)documentsDirectory
+ {
+    if (_documentsDirectory == nil)
+    {
+-#if TARGET_OS_IOS
++#if TARGET_OS_IOS || TARGET_OS_VISION
+       NSArray *paths      = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+ #elif TARGET_OS_TV
+       NSArray *paths      = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+@@ -844,8 +1156,27 @@ - (void)processKSCrashReports
+ }
+ #endif
+ 
++#if defined(RA_VISION_3D)
++/* SwiftUI is the app entry on the visionOS 3D build, so UIKit's launch
++ * callback fires BEFORE any scene exists.  Bringing RetroArch up here would
++ * mean initialising the Metal driver against a view with no window (zero
++ * bounds, no drawable size).  Defer the whole body to raVisionLaunch:, which
++ * the hosted view controller calls from -viewDidAppear. */
++- (void)applicationDidFinishLaunching:(UIApplication *)application
++{
++   ra_install_crash_handlers();
++   RA_BeaconMark("applicationDidFinishLaunching (deferred: visionOS SwiftUI shell)");
++}
++
++- (void)raVisionLaunch:(UIApplication *)application
++{
++   RA_BeaconMark("raVisionLaunch");
++#else
+ - (void)applicationDidFinishLaunching:(UIApplication *)application
+ {
++   ra_install_crash_handlers();
++   RA_BeaconMark("applicationDidFinishLaunching");
++#endif
+ #ifdef HAVE_KSCRASH
+    [self initKSCrash];
+ #endif
+@@ -900,10 +1231,22 @@ - (void)applicationDidFinishLaunching:(UIApplication *)application
+     * Under ARC the strong setter retains and ARC scope-releases the
+     * temp.  Statement-only macro, so RARCH_AUTORELEASE goes on its
+     * own line. */
++#if defined(RA_VISION_3D)
++   /* The SwiftUI WindowGroup owns the window; the host view controller already
++    * assigned it to self.window.  Creating (let alone key-and-visible-ing) a
++    * second UIWindow here would fight SwiftUI for the scene. */
++#elif TARGET_OS_VISION
++   /* visionOS: no UIScreen; the scene sizes the window. */
++   UIWindow *win      = [[UIWindow alloc] init];
++   RARCH_AUTORELEASE(win);
++   self.window        = win;
++   [self.window makeKeyAndVisible];
++#else
+    UIWindow *win      = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
+    RARCH_AUTORELEASE(win);
+    self.window        = win;
+    [self.window makeKeyAndVisible];
++#endif
+ 
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleAudioSessionInterruption:) name:AVAudioSessionInterruptionNotification object:[AVAudioSession sharedInstance]];
+ 
+@@ -1257,7 +1600,14 @@ - (void)showGameView
+    [[UIApplication sharedApplication] setIdleTimerDisabled:true];
+ #endif
+ 
++#if defined(RA_VISION_3D)
++   /* CocoaView is already installed as a child of the SwiftUI-hosted view
++    * controller; taking over the window's root would evict SwiftUI's hosting
++    * controller and with it the ornament, the settings sheet and the
++    * ImmersiveSpace environment actions. */
++#else
+    [self.window setRootViewController:[CocoaView get]];
++#endif
+ 
+    /* Initialize hidden keyboard text field for iOS native keyboard support */
+    if (!self.keyboardTextField)
+@@ -1517,6 +1867,62 @@ bool ios_keyboard_start(char **buffer_ptr, size_t *size_ptr, size_t *ptr_ptr,
+    app.keyboardPtrPtr = ptr_ptr;
+    app.keyboardAllocatedBuffer = allocated_buffer;
+ 
++#if TARGET_OS_VISION
++   /* visionOS: the hidden 1x1 UITextField + becomeFirstResponder trick doesn't
++    * route the gaze-driven system keyboard to an offscreen field (input never
++    * commits) and SIGTRAPs inside the responder/input-session machinery
++    * Use a modal UIAlertController with a real,
++    * focusable text field — gaze- and hardware-keyboard native — and commit once
++    * on OK through the same completion flow. */
++   {
++      UIAlertController *ac = [UIAlertController
++         alertControllerWithTitle:(label ? @(label) : @"Enter text")
++                          message:nil
++                   preferredStyle:UIAlertControllerStyleAlert];
++      [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
++         tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
++         tf.autocorrectionType     = UITextAutocorrectionTypeNo;
++         tf.spellCheckingType      = UITextSpellCheckingTypeNo;
++         tf.smartQuotesType        = UITextSmartQuotesTypeNo;
++      }];
++      /* Pass the alert's text straight to the RA callback (don't route through
++       * allocated_buffer — RA's line buffer may be realloc'd by the rename
++       * append below). Only call on OK; always tear down RA's line state. */
++      void (^finish)(const char *) = ^(const char *text) {
++         input_driver_state_t *input_st = input_state_get_ptr();
++         if (text && callback)
++            callback(userdata, text);
++         if (input_st)
++         {
++            input_keyboard_line_free(input_st);
++            input_st->flags &= ~INP_FLAG_KB_MAPPING_BLOCKED;
++         }
++         app.keyboardAlert = nil;
++      };
++      __weak UIAlertController *wac = ac;
++      [ac addAction:[UIAlertAction actionWithTitle:@"OK"
++         style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
++            const char *text = wac.textFields.firstObject.text.UTF8String;
++            finish(text ? text : "");
++         }]];
++      [ac addAction:[UIAlertAction actionWithTitle:@"Cancel"
++         style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
++            finish(NULL);
++         }]];
++      app.keyboardAlert = ac;
++      /* Rename seeds the current title into the line buffer AFTER this returns
++       * (menu_cbs_ok.c action_ok_rename_entry: input_keyboard_line_append). The
++       * present-completion runs post-append, so read the LIVE *buffer_ptr then to
++       * pre-fill the field with the current name (edit-in-place UX). */
++      char **bp = buffer_ptr;
++      [[CocoaView get] presentViewController:ac animated:YES completion:^{
++         const char *cur = (bp && *bp) ? *bp : NULL;
++         if (cur && cur[0])
++            wac.textFields.firstObject.text = @(cur);
++      }];
++      return true;
++   }
++#else
+    /* Set up the text field with initial text from the buffer */
+    app.keyboardTextField.text = (allocated_buffer[0] != '\0') ?
+       [NSString stringWithUTF8String:allocated_buffer] : @"";
+@@ -1544,17 +1950,31 @@ bool ios_keyboard_start(char **buffer_ptr, size_t *size_ptr, size_t *ptr_ptr,
+    /* Show the keyboard */
+    [app.keyboardTextField becomeFirstResponder];
+    return true;
++#endif
+ }
+ 
+ bool ios_keyboard_active(void)
+ {
+    RetroArch_iOS *app = [RetroArch_iOS get];
++#if TARGET_OS_VISION
++   return app && app.keyboardAlert != nil;
++#else
+    return app && app.keyboardTextField && [app.keyboardTextField isFirstResponder];
++#endif
+ }
+ 
+ void ios_keyboard_end(void)
+ {
+    RetroArch_iOS *app = [RetroArch_iOS get];
++#if TARGET_OS_VISION
++   /* RA cancelled from its side (e.g. B button) — dismiss the alert if present. */
++   if (app && app.keyboardAlert)
++   {
++      [app.keyboardAlert dismissViewControllerAnimated:YES completion:nil];
++      app.keyboardAlert = nil;
++      apple_input_keyboard_reset();
++   }
++#else
+    if (app && app.keyboardTextField)
+    {
+       [app.keyboardTextField resignFirstResponder];
+@@ -1563,8 +1983,43 @@ void ios_keyboard_end(void)
+       /* Reset keyboard state to ensure keys aren't stuck after dialog closes */
+       apple_input_keyboard_reset();
+    }
++#endif
+ }
+ 
++#if defined(RA_VISION_3D)
++/* Swift's @main (RAVisionApp.swift) provides main() on the visionOS 3D build —
++ * an ImmersiveSpace can only be declared from a SwiftUI App.  RetroArch_iOS
++ * stays the UIApplicationDelegate via @UIApplicationDelegateAdaptor, so
++ * [RetroArch_iOS get] and everything hanging off it are unchanged.
++ *
++ * Known cost, accepted: the RApplication UIApplication subclass (a legacy
++ * private-API hardware-keyboard path, already #ifndef HAVE_APPLE_STORE) cannot
++ * be installed under the SwiftUI lifecycle.  visionOS keyboard input goes
++ * through the modern UIKit press path and the alert-based text entry instead. */
++
++/* The RetroArch menu is drawn by the frontend, not by the core, so it only
++ * exists in the flat composite — the stereo loop has to fall back to that path
++ * whenever it is up. */
++bool ra_vision_menu_alive(void)
++{
++#ifdef HAVE_MENU
++   struct menu_state *menu_st = menu_state_get_ptr();
++   return menu_st && (menu_st->flags & MENU_ST_FLAG_ALIVE);
++#else
++   return false;
++#endif
++}
++
++/* Deferred launch trampoline for RAVisionHost.m. */
++void ra_vision_launch(void)
++{
++   static bool launched = false;
++   if (launched)
++      return;
++   launched = true;
++   [[RetroArch_iOS get] raVisionLaunch:[UIApplication sharedApplication]];
++}
++#else
+ int main(int argc, char *argv[])
+ {
+ #if TARGET_OS_IOS
+@@ -1580,3 +2035,4 @@ int main(int argc, char *argv[])
+       return UIApplicationMain(argc, argv, NSStringFromClass([RApplication class]), NSStringFromClass([RetroArch_iOS class]));
+    }
+ }
++#endif /* RA_VISION_3D */

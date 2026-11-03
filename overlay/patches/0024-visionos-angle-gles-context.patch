@@ -1,0 +1,836 @@
+diff --git a/gfx/drivers/gl2.c b/gfx/drivers/gl2.c
+index b67ec95..9ff3f4e 100644
+--- a/gfx/drivers/gl2.c
++++ b/gfx/drivers/gl2.c
+@@ -460,8 +460,9 @@ static void gl2_set_viewport(gl2_t *gl,
+       unsigned vp_width, unsigned vp_height,
+       bool force_full, bool allow_rotate);
+ 
+-#ifdef IOS
+-/* There is no default frame buffer on iOS. */
++#if defined(IOS) && !defined(RA_VISIONOS)
++/* There is no default frame buffer on iOS (EAGL). On visionOS GLES comes
++ * from ANGLE via EGL, where the window surface is the default FBO 0. */
+ void glkitview_bind_fbo(void);
+ #define gl2_renderchain_bind_backbuffer() glkitview_bind_fbo()
+ #else
+diff --git a/gfx/drivers_context/cocoa_angle_ctx.m b/gfx/drivers_context/cocoa_angle_ctx.m
+new file mode 100644
+index 0000000..75afdc8
+--- /dev/null
++++ b/gfx/drivers_context/cocoa_angle_ctx.m
+@@ -0,0 +1,783 @@
++/*  RetroArch - A frontend for libretro.
++ *  Copyright (C) 2011-2017 - Daniel De Matteis
++ *
++ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
++ *  of the GNU General Public License as published by the Free Software Found-
++ *  ation, either version 3 of the License, or (at your option) any later version.
++ *
++ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++ *  PURPOSE.  See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with RetroArch.
++ *  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* visionOS GLES context via ANGLE (GLES3-over-Metal).
++ *
++ * visionOS has no EAGL/GLKit, so the stock cocoa GL context cannot exist
++ * there.  This driver provides the GLES3 context GLideN64-class cores need by
++ * driving ANGLE's Metal backend through standard EGL on a CAMetalLayer — the
++ * same MetalLayerView surface the Vulkan context uses.  ANGLE.framework
++ * (built from WebKit's visionOS-proven copy) is bundled like MoltenVK.
++ *
++ * Threading: with untreaded video (Apple default) everything here runs on the
++ * main thread.  The UIKit view swap is marshaled through
++ * cocoa_main_thread_sync so a threaded-video config stays correct; all EGL
++ * calls stay on the video thread (EGL current-context is per-thread). */
++
++#ifdef HAVE_CONFIG_H
++#include "../../config.h"
++#endif
++
++#include <TargetConditionals.h>
++
++#import <UIKit/UIKit.h>
++#import <QuartzCore/CAMetalLayer.h>
++
++#include <retro_atomic.h>
++#include <string/stdstring.h>
++
++#include "../common/egl_common.h"
++
++#if TARGET_OS_VISION
++/* 0033 pacing: split the swap wait out of the measured iterate() time, so the
++ * 2s pace line can say whether an expensive frame is real work or a block
++ * inside eglSwapBuffers. Defined in ui/drivers/cocoa/cocoa_common.m. */
++#include <mach/mach_time.h>
++void ra_pace_swap_note(uint64_t mach_delta);
++
++/* ---------------------------------------------------------- blob cache -----
++ * EGL_ANDROID_blob_cache: ANGLE calls these to persist its internal shader /
++ * program blobs. Without them every process lifetime retranslates GLSL->MSL and
++ * recompiles through Metal from cold, which is what a level load is doing
++ * during the black screen. Wiring measured in the macOS harness
++ * GoldenEye writes 23
++ * blobs / 155 KB cold, then a warm run is 24/24 hits and 0 sets. It bought no
++ * measurable load time on an M4 Pro (~4 ms off the worst frame), so it ships as
++ * a cheap bet on the headset's much slower Metal compiler — NOT as a promise.
++ *
++ * Callbacks are ported verbatim from the harness host. EGLsizeiANDROID is
++ * khronos_ssize_t == long. `get` must return the blob's REAL size and fill the
++ * buffer only when it fits; ANGLE re-calls with a bigger one. Must be installed
++ * after eglInitialize and before any context exists. */
++#include <sys/stat.h>
++#include <dirent.h>
++#include <errno.h>
++#include <pthread.h>
++
++typedef long RA_EGLsizeiANDROID;
++
++static char s_blob_dir[1024];
++
++static void ra_blob_path(char *out, size_t n, const void *key, RA_EGLsizeiANDROID ks)
++{
++   size_t pos = 0;
++   const unsigned char *k = (const unsigned char*)key;
++   if (ks > 0 && ks <= 96)
++   {
++      RA_EGLsizeiANDROID i;
++      pos = (size_t)snprintf(out, n, "%s/", s_blob_dir);
++      for (i = 0; i < ks && pos + 3 < n; i++)
++         pos += (size_t)snprintf(out + pos, n - pos, "%02x", k[i]);
++      snprintf(out + pos, n - pos, ".bin");
++   }
++   else
++   {
++      RA_EGLsizeiANDROID i;
++      uint64_t h = 1469598103934665603ull;
++      for (i = 0; i < ks; i++) { h ^= k[i]; h *= 1099511628211ull; }
++      snprintf(out, n, "%s/h%016llx-%ld.bin", s_blob_dir,
++            (unsigned long long)h, (long)ks);
++   }
++}
++
++static void ra_blob_set(const void *key, RA_EGLsizeiANDROID ks,
++      const void *value, RA_EGLsizeiANDROID vs)
++{
++   char path[2048];
++   FILE *f;
++   if (!s_blob_dir[0] || ks <= 0 || vs <= 0)
++      return;
++   ra_blob_path(path, sizeof(path), key, ks);
++   if (!(f = fopen(path, "wb")))
++      return;
++   fwrite(value, 1, (size_t)vs, f);
++   fclose(f);
++}
++
++static RA_EGLsizeiANDROID ra_blob_get(const void *key, RA_EGLsizeiANDROID ks,
++      void *value, RA_EGLsizeiANDROID vs)
++{
++   char path[2048];
++   FILE *f;
++   long  sz;
++   if (!s_blob_dir[0] || ks <= 0)
++      return 0;
++   ra_blob_path(path, sizeof(path), key, ks);
++   if (!(f = fopen(path, "rb")))
++      return 0;
++   fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
++   if (sz > 0 && vs >= sz)
++   {
++      if (fread(value, 1, (size_t)sz, f) != (size_t)sz)
++         sz = 0;
++   }
++   fclose(f);
++   return (RA_EGLsizeiANDROID)sz;
++}
++
++/* Keep the directory bounded: one pass at startup, oldest-first, down to 64 MB.
++ * Blobs are pure cache — deleting one costs a recompile, never user data. */
++#define RA_BLOB_CACHE_MAX_BYTES (64u * 1024u * 1024u)
++
++static void ra_blob_prune(void)
++{
++   struct entry { char name[256]; time_t mtime; off_t size; };
++   struct entry *list = NULL;
++   size_t n = 0, cap = 0;
++   unsigned long long total = 0;
++   DIR *d = opendir(s_blob_dir);
++   struct dirent *de;
++   size_t i, j;
++
++   if (!d)
++      return;
++   while ((de = readdir(d)))
++   {
++      char p[2048];
++      struct stat st;
++      if (de->d_name[0] == '.')
++         continue;
++      snprintf(p, sizeof(p), "%s/%s", s_blob_dir, de->d_name);
++      if (stat(p, &st) != 0 || !S_ISREG(st.st_mode))
++         continue;
++      if (n == cap)
++      {
++         struct entry *nl;
++         cap = cap ? cap * 2 : 128;
++         if (!(nl = (struct entry*)realloc(list, cap * sizeof(*list))))
++            break;
++         list = nl;
++      }
++      strlcpy(list[n].name, de->d_name, sizeof(list[n].name));
++      list[n].mtime = st.st_mtime;
++      list[n].size  = st.st_size;
++      total += (unsigned long long)st.st_size;
++      n++;
++   }
++   closedir(d);
++
++   if (total > RA_BLOB_CACHE_MAX_BYTES)
++   {
++      /* Insertion sort, oldest first. n is in the hundreds at most. */
++      for (i = 1; i < n; i++)
++      {
++         struct entry tmp = list[i];
++         for (j = i; j > 0 && list[j - 1].mtime > tmp.mtime; j--)
++            list[j] = list[j - 1];
++         list[j] = tmp;
++      }
++      for (i = 0; i < n && total > RA_BLOB_CACHE_MAX_BYTES; i++)
++      {
++         char p[2048];
++         snprintf(p, sizeof(p), "%s/%s", s_blob_dir, list[i].name);
++         if (remove(p) == 0)
++            total -= (unsigned long long)list[i].size;
++      }
++   }
++   free(list);
++}
++
++/* Install right after eglInitialize, before any context is created. */
++static void ra_blob_cache_install(EGLDisplay dpy)
++{
++   typedef void (*setfuncs_t)(EGLDisplay,
++         void (*)(const void*, RA_EGLsizeiANDROID, const void*, RA_EGLsizeiANDROID),
++         RA_EGLsizeiANDROID (*)(const void*, RA_EGLsizeiANDROID, void*, RA_EGLsizeiANDROID));
++   setfuncs_t setfuncs;
++   const char *home = getenv("HOME");
++   char _m[320];
++   extern void RA_BeaconMark(const char *);
++
++   if (!home || !dpy)
++      return;
++
++   snprintf(s_blob_dir, sizeof(s_blob_dir), "%s/Documents/RetroArch/cache", home);
++   mkdir(s_blob_dir, 0755);   /* Documents/RetroArch already exists by now */
++   snprintf(s_blob_dir, sizeof(s_blob_dir),
++         "%s/Documents/RetroArch/cache/angle-blob", home);
++   if (mkdir(s_blob_dir, 0755) != 0 && errno != EEXIST)
++   {
++      s_blob_dir[0] = '\0';
++      return;
++   }
++   ra_blob_prune();
++
++   setfuncs = (setfuncs_t)eglGetProcAddress("eglSetBlobCacheFuncsANDROID");
++   if (!setfuncs)
++   {
++      s_blob_dir[0] = '\0';
++      RA_BeaconMark("angle blob cache: eglSetBlobCacheFuncsANDROID NOT FOUND");
++      return;
++   }
++   setfuncs(dpy, ra_blob_set, ra_blob_get);
++   snprintf(_m, sizeof(_m), "angle blob cache armed: %s", s_blob_dir);
++   RA_BeaconMark(_m);
++}
++#endif
++
++#include "../../ui/drivers/cocoa/cocoa_common.h"
++#include "../../ui/drivers/cocoa/apple_platform.h"
++#include "../../configuration.h"
++#include "../../retroarch.h"
++#include "../../verbosity.h"
++
++#if TARGET_OS_VISION
++#include "../video_driver.h"
++
++/* ANGLE's per-thread egl::Thread pthread key is the object that dies across a
++ * content close. A
++ * LIVE key round-trips a value; a dead one silently drops it, because
++ * pthread_setspecific on an invalid key is a no-op with the ASSERT compiled out.
++ * The index also tells us whether key slots are being recycled: if `nextkey`
++ * comes back LOWER after a close than it was before, the core's teardown freed
++ * indices and the -DNO_DLCLOSE prevention is confirmed on device. Costs one key,
++ * created and destroyed immediately, twice per content session. */
++static void ra_angle_keyprobe(const char *phase)
++{
++   pthread_key_t k  = 0;
++   void         *rt = (void*)-1;
++   char _m[192];
++   extern void RA_BeaconMark(const char *);
++
++   if (pthread_key_create(&k, NULL) == 0)
++   {
++      pthread_setspecific(k, (void*)0xA11CE);
++      rt = pthread_getspecific(k);
++      pthread_key_delete(k);
++   }
++   snprintf(_m, sizeof(_m),
++         "angle %s: cur=%p keyprobe=%p (want 0xa11ce) nextkey=%u",
++         phase, (void*)eglGetCurrentContext(), rt, (unsigned)k);
++   RA_BeaconMark(_m);
++}
++
++/* Widescreen diagnosis (the tester: SM64 letterboxed with rainbow bars, while the
++ * harness exonerated the core —). Logs
++ * the drawable the ANGLE surface actually has, the viewport RetroArch computed
++ * inside it, and both aspect numbers. Change-gated, so a steady session prints
++ * one line and a resize or aspect change prints one more. */
++static void ra_angle_vp_beacon(unsigned draw_w, unsigned draw_h)
++{
++   static unsigned last[6];
++   static float    last_ar, last_gar;
++   video_viewport_t vp;
++   float ar, gar = 0.0f;
++   video_driver_state_t *vst = video_state_get_ptr();
++   char _m[256];
++   extern void RA_BeaconMark(const char *);
++
++   memset(&vp, 0, sizeof(vp));
++   if (!video_driver_get_viewport_info(&vp))
++      return;
++   ar  = video_driver_get_aspect_ratio();
++   if (vst)
++      gar = vst->av_info.geometry.aspect_ratio;
++
++   if (   last[0] == draw_w && last[1] == draw_h
++       && last[2] == (unsigned)vp.x && last[3] == (unsigned)vp.y
++       && last[4] == vp.width && last[5] == vp.height
++       && last_ar == ar && last_gar == gar)
++      return;
++   last[0] = draw_w; last[1] = draw_h;
++   last[2] = (unsigned)vp.x; last[3] = (unsigned)vp.y;
++   last[4] = vp.width; last[5] = vp.height;
++   last_ar = ar; last_gar = gar;
++
++   snprintf(_m, sizeof(_m),
++         "angle vp: drawable=%ux%u vp=%d,%d %ux%u full=%ux%u ar=%.4f geom_ar=%.4f",
++         draw_w, draw_h, vp.x, vp.y, vp.width, vp.height,
++         vp.full_width, vp.full_height, ar, gar);
++   RA_BeaconMark(_m);
++}
++
++#endif
++
++#ifndef EGL_OPENGL_ES3_BIT_KHR
++#define EGL_OPENGL_ES3_BIT_KHR 0x0040
++#endif
++
++typedef struct
++{
++   int swap_interval;
++   unsigned width;
++   unsigned height;
++} cocoa_angle_ctx_data_t;
++
++/* TODO/FIXME - static globals (same pattern as the other cocoa contexts) */
++static bool cocoa_angle_es3 = true;
++
++/* EGL display+context persist for the app's lifetime.  ANGLE must NEVER be
++ * terminated mid-process: the terminate/re-init cycle (egl_destroy ->
++ * eglTerminate on every content close) dangles ANGLE's per-thread context
++ * state and crashes the next eglMakeCurrent — and even eglReleaseThread —
++ * with a ScopedSyncCurrentContextFromThread UAF (was deterministic on the 2nd
++ * N64 load).  Only the window surface is per-content; we recreate just that.
++ * This is how ANGLE is used in production (WebKit inits the display once and
++ * never terminates it). */
++static egl_ctx_data_t s_egl;   /* zero-init: dpy == EGL_NO_DISPLAY */
++/* Identity of the CAMetalLayer s_egl's surface is bound to.  With the ANGLE view
++ * now an app-lifetime singleton (ui_cocoatouch setViewType), this never changes
++ * after first init, so on re-entry we re-make-current the existing surface
++ * instead of destroying/recreating it — nothing ANGLE's thread references ever
++ * dies. */
++static void *s_egl_layer;      /* identity only; the singleton view owns the layer */
++
++CocoaView *cocoaview_get(void);
++/* Defined in ui/drivers/cocoa/cocoa_common.m (same declared-locally pattern
++ * as cocoa_vk_ctx.m, avoiding edits to the CRLF-formatted cocoa_common.h). */
++void cocoa_main_thread_sync(void (*func)(void *userdata), void *userdata);
++
++static CAMetalLayer *cocoa_angle_layer(void)
++{
++   UIView *v = (UIView *)apple_platform.renderView;
++   if ([v isKindOfClass:[MetalLayerView class]])
++      return ((MetalLayerView *)v).metalLayer;
++   return nil;
++}
++
++/* -- UIKit portion of set_video_mode; must run on the main thread -- */
++typedef struct
++{
++   void       *layer;   /* out: CAMetalLayer* (unretained)   */
++   unsigned    width;   /* out: layer size in device pixels  */
++   unsigned    height;
++} cocoa_angle_view_args_t;
++
++static void cocoa_angle_prepare_view_mainthread(void *userdata)
++{
++   cocoa_angle_view_args_t *args = (cocoa_angle_view_args_t*)userdata;
++   CAMetalLayer *layer           = NULL;
++
++   /* Creates/attaches the MetalLayerView render surface (see the
++    * TARGET_OS_VISION branch of setViewType:).  Idempotent when already
++    * the active view type. */
++   [apple_platform setViewType:APPLE_VIEW_TYPE_OPENGL_ES];
++
++   layer = cocoa_angle_layer();
++   if (layer)
++   {
++      CGSize  b     = layer.bounds.size;
++      CGFloat scale = layer.contentsScale > 0.0 ? layer.contentsScale : 1.0;
++      /* (round-8 set layer.opaque=YES on the compositor-punch-through theory;
++       * disproven on device and a suspect in the 59->45fps regression, so
++       * reverted to the CAMetalLayer default here — A-.) */
++      args->layer   = (BRIDGE void *)layer;
++      args->width   = (unsigned)(b.width  * scale);
++      args->height  = (unsigned)(b.height * scale);
++   }
++   else
++   {
++      args->layer  = NULL;
++      args->width  = 0;
++      args->height = 0;
++   }
++}
++
++/* eglGetCurrentDisplay/Context/Surface do NOT construct
++ * ScopedSyncCurrentContextFromThread (egl_stubs.cpp:410-436) — they are plain
++ * reads of the thread's state, so they stay safe even where eglMakeCurrent
++ * would fault. Used here to skip make-current whenever the binding already is
++ * what we want, which on the reload path is always. */
++static bool cocoa_angle_already_current(EGLContext want)
++{
++   return    eglGetCurrentDisplay()         == s_egl.dpy
++          && eglGetCurrentContext()         == want
++          && eglGetCurrentSurface(EGL_DRAW) == s_egl.surf
++          && eglGetCurrentSurface(EGL_READ) == s_egl.surf;
++}
++
++static bool cocoa_angle_make_current(EGLContext want)
++{
++   if (cocoa_angle_already_current(want))
++      return true;
++   return eglMakeCurrent(s_egl.dpy, s_egl.surf, s_egl.surf, want);
++}
++
++static void cocoa_angle_gfx_ctx_destroy(void *data)
++{
++   cocoa_angle_ctx_data_t *cocoa_ctx = (cocoa_angle_ctx_data_t*)data;
++
++   if (!cocoa_ctx)
++      return;
++
++   /* Content close: touch NOTHING. The display, context, surface and the
++    * singleton MetalLayerView/CAMetalLayer are all app-lifetime, so the
++    * binding stays valid across the metal-menu period.
++    *
++    * We deliberately no longer eglMakeCurrent(EGL_NO_*) here. eglMakeCurrent is
++    * one of only four EGL entry points that construct
++    * egl::ScopedSyncCurrentContextFromThread, whose destructor stores
++    * unconditionally through ANGLE's per-thread egl::Thread TLS slot
++    * (global_state.cpp:150 -> Thread::setCurrent, `str x1,[x0,#0x18]`, no null
++    * check, ASSERT compiled out). That store is the 2nd-load SIGSEGV.
++    * The stale object is ANGLE's thread TLS, not any handle we own, so the port
++    * cannot repair it — it can only stop issuing the call. Leaving the context
++    * current means the reload path issues no sync-bearing EGL call at all.
++    * */
++   if (s_egl.dpy)
++   {
++      char _m[176];
++      extern void RA_BeaconMark(const char *);
++      snprintf(_m, sizeof(_m),
++            "angle destroy keep-current: dpy=%p ctx=%p surf=%p cur=%p",
++            (void*)s_egl.dpy, (void*)s_egl.ctx, (void*)s_egl.surf,
++            (void*)eglGetCurrentContext());
++      RA_BeaconMark(_m);
++#if TARGET_OS_VISION
++      ra_angle_keyprobe("close");
++#endif
++   }
++   free(cocoa_ctx);
++}
++
++static void *cocoa_angle_gfx_ctx_init(void *video_driver)
++{
++   cocoa_angle_ctx_data_t *cocoa_ctx = (cocoa_angle_ctx_data_t*)
++      calloc(1, sizeof(*cocoa_ctx));
++
++   if (!cocoa_ctx)
++      return NULL;
++
++   return cocoa_ctx;
++}
++
++static enum gfx_ctx_api cocoa_angle_gfx_ctx_get_api(void *data)
++{
++   return GFX_CTX_OPENGL_ES_API;
++}
++
++static bool cocoa_angle_gfx_ctx_bind_api(void *data,
++      enum gfx_ctx_api api, unsigned major, unsigned minor)
++{
++   if (api != GFX_CTX_OPENGL_ES_API)
++      return false;
++   cocoa_angle_es3 = (major >= 3 || major == 0);
++   return true;
++}
++
++static void cocoa_angle_gfx_ctx_set_swap_interval(void *data,
++      int swap_interval)
++{
++   cocoa_angle_ctx_data_t *cocoa_ctx = (cocoa_angle_ctx_data_t*)data;
++
++   if (!cocoa_ctx)
++      return;
++
++   cocoa_ctx->swap_interval = swap_interval;
++   if (s_egl.dpy)
++      egl_set_swap_interval(&s_egl, swap_interval);
++}
++
++static bool cocoa_angle_gfx_ctx_set_video_mode(void *data,
++      unsigned width, unsigned height, bool fullscreen)
++{
++#if TARGET_OS_VISION
++   /* Pairs with the "angle close" probe: a nextkey that came DOWN across the
++    * close means indices were recycled by the core teardown. */
++   ra_angle_keyprobe("load");
++#endif
++   struct retro_hw_render_callback *hwr = video_driver_get_hw_context();
++   cocoa_angle_ctx_data_t *cocoa_ctx    = (cocoa_angle_ctx_data_t*)data;
++   cocoa_angle_view_args_t view_args    = {0};
++   EGLint major = 0, minor = 0, n = 0;
++   EGLint attribs[] = {
++      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
++      EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
++      EGL_RED_SIZE,        8,
++      EGL_GREEN_SIZE,      8,
++      EGL_BLUE_SIZE,       8,
++      EGL_ALPHA_SIZE,      8,   /* round-8 tried 0 (compositor theory, disproven) — reverted (A-) */
++      EGL_DEPTH_SIZE,      0,
++      EGL_NONE
++   };
++   EGLint ctx_attribs[] = {
++      EGL_CONTEXT_CLIENT_VERSION, 3,
++      EGL_NONE
++   };
++
++   if (!cocoa_ctx)
++      return false;
++
++   if (!cocoa_angle_es3)
++   {
++      attribs[1]     = EGL_OPENGL_ES2_BIT;
++      ctx_attribs[1] = 2;
++   }
++
++   cocoa_main_thread_sync(cocoa_angle_prepare_view_mainthread, &view_args);
++
++   if (!view_args.layer)
++   {
++      RARCH_ERR("[ANGLE-Cocoa] No CAMetalLayer render surface available.\n");
++      return false;
++   }
++
++   /* Persistent display+context (s_egl): created once per process, never
++    * terminated.  Per content load we (re)create ONLY the window surface.
++    * egl_create_surface destroys any old surface first, then creates the new
++    * one and makes it current (egl_common.c:690-710) — the whole per-content
++    * story, with no display/context churn to dangle ANGLE's thread state.
++    * */
++   if (s_egl.dpy && s_egl.ctx)
++   {
++      {
++         char _m[176];
++         extern void RA_BeaconMark(const char *);
++         snprintf(_m, sizeof(_m),
++               "angle reuse: layer=%p cached=%p surf=%p cur=%p",
++               view_args.layer, s_egl_layer, (void*)s_egl.surf,
++               (void*)eglGetCurrentContext());
++         RA_BeaconMark(_m);
++      }
++      /* Singleton view => same CAMetalLayer as before => the surface is still
++       * valid; just re-make-current it, destroy nothing. */
++      if (s_egl.surf != EGL_NO_SURFACE && view_args.layer == s_egl_layer)
++      {
++         if (!cocoa_angle_make_current(s_egl.ctx))
++         {
++            egl_report_error();
++            RARCH_ERR("[ANGLE-Cocoa] Failed to re-make-current the reused surface.\n");
++            return false;
++         }
++      }
++      /* Defensive: layer identity changed (should not happen post-singleton) —
++       * rebuild the surface on the new layer. */
++      else
++      {
++         if (!egl_create_surface(&s_egl, view_args.layer))
++         {
++            egl_report_error();
++            RARCH_ERR("[ANGLE-Cocoa] Failed to recreate EGL surface on CAMetalLayer.\n");
++            return false;
++         }
++         s_egl_layer = view_args.layer;
++      }
++      egl_get_video_size(&s_egl, &cocoa_ctx->width, &cocoa_ctx->height);
++      if (!cocoa_ctx->width || !cocoa_ctx->height)
++      {
++         cocoa_ctx->width  = view_args.width;
++         cocoa_ctx->height = view_args.height;
++      }
++      egl_set_swap_interval(&s_egl, cocoa_ctx->swap_interval);
++      RARCH_LOG("[ANGLE-Cocoa] Surface %ux%u ready (reused).\n",
++            cocoa_ctx->width, cocoa_ctx->height);
++      return true;
++   }
++
++   /* First time in this process: full display/config/context init into s_egl. */
++   egl_init_dll();
++
++   if (!egl_init_context(&s_egl, EGL_NONE,
++            (void*)EGL_DEFAULT_DISPLAY, &major, &minor, &n, attribs, NULL))
++   {
++      egl_report_error();
++      RARCH_ERR("[ANGLE-Cocoa] Failed to initialize EGL display/config.\n");
++      return false;
++   }
++
++   RARCH_LOG("[ANGLE-Cocoa] EGL %d.%d initialized (%s).\n",
++         (int)major, (int)minor, cocoa_angle_es3 ? "ES3" : "ES2");
++
++#if TARGET_OS_VISION
++   /* Must be after eglInitialize and before any context exists. */
++   ra_blob_cache_install(s_egl.dpy);
++#endif
++
++   s_egl.use_hw_ctx =
++         hwr && (hwr->context_type != RETRO_HW_CONTEXT_NONE);
++
++   if (!egl_create_context(&s_egl, ctx_attribs))
++   {
++      egl_report_error();
++      RARCH_ERR("[ANGLE-Cocoa] Failed to create EGL context.\n");
++      goto error;
++   }
++
++   if (!egl_create_surface(&s_egl, view_args.layer))
++   {
++      egl_report_error();
++      RARCH_ERR("[ANGLE-Cocoa] Failed to create EGL window surface on CAMetalLayer.\n");
++      goto error;
++   }
++   s_egl_layer = view_args.layer;   /* reuse-identity for subsequent loads */
++
++   egl_get_video_size(&s_egl,
++         &cocoa_ctx->width, &cocoa_ctx->height);
++   if (!cocoa_ctx->width || !cocoa_ctx->height)
++   {
++      cocoa_ctx->width  = view_args.width;
++      cocoa_ctx->height = view_args.height;
++   }
++
++   egl_set_swap_interval(&s_egl, cocoa_ctx->swap_interval);
++
++   RARCH_LOG("[ANGLE-Cocoa] Surface %ux%u ready.\n",
++         cocoa_ctx->width, cocoa_ctx->height);
++
++   return true;
++
++error:
++   /* Surface creation failed — drop just the surface; the display/context stay
++    * standing (known-good once created) for the next attempt.  Never terminate.
++    * */
++   egl_destroy_surface(&s_egl);
++   return false;
++}
++
++static void cocoa_angle_gfx_ctx_get_video_size(void *data,
++      unsigned *width, unsigned *height)
++{
++   cocoa_angle_ctx_data_t *cocoa_ctx = (cocoa_angle_ctx_data_t*)data;
++
++   if (!cocoa_ctx)
++   {
++      *width  = 0;
++      *height = 0;
++      return;
++   }
++
++   if (s_egl.dpy && s_egl.surf)
++      egl_get_video_size(&s_egl, width, height);
++   else
++   {
++      *width  = cocoa_ctx->width;
++      *height = cocoa_ctx->height;
++   }
++}
++
++static void cocoa_angle_gfx_ctx_check_window(void *data, bool *quit,
++      bool *resize, unsigned *width, unsigned *height)
++{
++   unsigned new_width  = 0;
++   unsigned new_height = 0;
++   cocoa_angle_ctx_data_t *cocoa_ctx = (cocoa_angle_ctx_data_t*)data;
++
++   *quit = false;
++
++   if (!cocoa_ctx)
++      return;
++
++   cocoa_angle_gfx_ctx_get_video_size(data, &new_width, &new_height);
++   if (     new_width  && new_height
++         && (new_width != *width || new_height != *height))
++   {
++      *width  = new_width;
++      *height = new_height;
++      *resize = true;
++      cocoa_ctx->width  = new_width;
++      cocoa_ctx->height = new_height;
++   }
++}
++
++static bool cocoa_angle_gfx_ctx_set_resize(void *data,
++      unsigned width, unsigned height) { return false; }
++
++static void cocoa_angle_gfx_ctx_input_driver(void *data,
++      const char *joypad_name,
++      input_driver_t **input, void **input_data)
++{
++   *input      = NULL;
++   *input_data = NULL;
++}
++
++static bool cocoa_angle_gfx_ctx_suppress_screensaver(void *data,
++      bool enable) { return false; }
++
++static void cocoa_angle_gfx_ctx_swap_buffers(void *data)
++{
++   cocoa_angle_ctx_data_t *cocoa_ctx = (cocoa_angle_ctx_data_t*)data;
++
++   if (cocoa_ctx && s_egl.dpy)
++   {
++#if TARGET_OS_VISION
++      uint64_t t0 = mach_absolute_time();
++      egl_swap_buffers(&s_egl);
++      ra_pace_swap_note(mach_absolute_time() - t0);
++      ra_angle_vp_beacon(cocoa_ctx->width, cocoa_ctx->height);
++#else
++      egl_swap_buffers(&s_egl);
++#endif
++   }
++}
++
++static void cocoa_angle_gfx_ctx_bind_hw_render(void *data, bool enable)
++{
++   cocoa_angle_ctx_data_t *cocoa_ctx = (cocoa_angle_ctx_data_t*)data;
++
++   if (cocoa_ctx && s_egl.dpy)
++   {
++      /* Was egl_bind_hw_render(), which always calls eglMakeCurrent. Same
++       * semantics minus the redundant sync-bearing calls. */
++      s_egl.use_hw_ctx = enable;
++      if (s_egl.surf != EGL_NO_SURFACE)
++         cocoa_angle_make_current(enable ? s_egl.hw_ctx : s_egl.ctx);
++   }
++}
++
++static uint32_t cocoa_angle_gfx_ctx_get_flags(void *data)
++{
++   uint32_t flags = 0;
++#ifdef HAVE_GLSL
++   BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_GLSL);
++#endif
++   return flags;
++}
++
++static void cocoa_angle_gfx_ctx_set_flags(void *data, uint32_t flags) { }
++
++static float cocoa_angle_gfx_ctx_get_refresh_rate(void *data)
++{
++   return cocoa_get_refresh_rate();
++}
++
++const gfx_ctx_driver_t gfx_ctx_cocoa_angle = {
++   cocoa_angle_gfx_ctx_init,
++   cocoa_angle_gfx_ctx_destroy,
++   cocoa_angle_gfx_ctx_get_api,
++   cocoa_angle_gfx_ctx_bind_api,
++   cocoa_angle_gfx_ctx_set_swap_interval,
++   cocoa_angle_gfx_ctx_set_video_mode,
++   cocoa_angle_gfx_ctx_get_video_size,
++   cocoa_angle_gfx_ctx_get_refresh_rate,
++   NULL, /* get_video_output_size */
++   NULL, /* get_video_output_prev */
++   NULL, /* get_video_output_next */
++   cocoa_get_metrics,
++   NULL, /* translate_aspect */
++   NULL, /* update_title */
++   cocoa_angle_gfx_ctx_check_window,
++   cocoa_angle_gfx_ctx_set_resize,
++   cocoa_has_focus,
++   cocoa_angle_gfx_ctx_suppress_screensaver,
++   false, /* has_windowed */
++   cocoa_angle_gfx_ctx_swap_buffers,
++   cocoa_angle_gfx_ctx_input_driver,
++#ifdef HAVE_EGL
++   egl_get_proc_address,
++#else
++   NULL,
++#endif
++   NULL, /* image_buffer_init */
++   NULL, /* image_buffer_write */
++   NULL, /* show_mouse */
++   "cocoa-angle",
++   cocoa_angle_gfx_ctx_get_flags,
++   cocoa_angle_gfx_ctx_set_flags,
++   cocoa_angle_gfx_ctx_bind_hw_render,
++   NULL, /* get_context_data */
++   NULL, /* make_current */
++   NULL, /* create_surface */
++   NULL  /* destroy_surface */
++};
+diff --git a/gfx/video_driver.h b/gfx/video_driver.h
+index 1098954..c471c43 100644
+--- a/gfx/video_driver.h
++++ b/gfx/video_driver.h
+@@ -1483,6 +1483,7 @@ extern const gfx_ctx_driver_t gfx_ctx_videocore;
+ extern const gfx_ctx_driver_t gfx_ctx_qnx;
+ extern const gfx_ctx_driver_t gfx_ctx_cgl;
+ extern const gfx_ctx_driver_t gfx_ctx_cocoagl;
++extern const gfx_ctx_driver_t gfx_ctx_cocoa_angle;
+ extern const gfx_ctx_driver_t gfx_ctx_cocoavk;
+ extern const gfx_ctx_driver_t gfx_ctx_emscripten;
+ extern const gfx_ctx_driver_t gfx_ctx_emscripten_webgl;
+diff --git a/griffin/griffin_objc.m b/griffin/griffin_objc.m
+index c8f34d2..66f6b08 100644
+--- a/griffin/griffin_objc.m
++++ b/griffin/griffin_objc.m
+@@ -39,9 +39,13 @@
+  * in cocoa_common.h for non-qb builds; set directly by qb. */
+ #include "../ui/drivers/cocoa/RetroArchPlaylistManager.m"
+ #endif
+-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
++#if (defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)) && !defined(RA_VISIONOS)
+ #include "../gfx/drivers_context/cocoa_gl_ctx.m"
+ #endif
++#if defined(RA_VISIONOS) && defined(HAVE_ANGLE)
++/* visionOS has no EAGL; GLES comes from ANGLE (GLES3-over-Metal). */
++#include "../gfx/drivers_context/cocoa_angle_ctx.m"
++#endif
+ #if defined(HAVE_VULKAN)
+ #include "../gfx/drivers_context/cocoa_vk_ctx.m"
+ #endif

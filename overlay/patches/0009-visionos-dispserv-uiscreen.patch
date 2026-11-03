@@ -1,0 +1,33 @@
+diff --git a/gfx/display_servers/dispserv_apple.m b/gfx/display_servers/dispserv_apple.m
+index 8d0f239..7df939f 100644
+--- a/gfx/display_servers/dispserv_apple.m
++++ b/gfx/display_servers/dispserv_apple.m
+@@ -413,10 +413,16 @@ static bool apple_display_server_set_resolution(void *data,
+ 
+    /* Use nativeBounds to get physical screen resolution
+     * (works correctly in multitasking/Split View modes) */
++#if TARGET_OS_VISION
++   /* visionOS: no UIScreen. Report ~4K (the drawable target) + ProMotion rates. */
++   width  = 3840;
++   height = 2160;
++#else
+    UIScreen *mainScreen = [UIScreen mainScreen];
+    CGRect nativeBounds = mainScreen.nativeBounds;
+    width = (unsigned)nativeBounds.size.width;
+    height = (unsigned)nativeBounds.size.height;
++#endif
+ #if (TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 150000) || (TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 150000)
+    if (@available(iOS 15, tvOS 15, *))
+       currentRate = [CocoaView get].displayLink.preferredFrameRateRange.preferred;
+@@ -428,7 +434,11 @@ static bool apple_display_server_set_resolution(void *data,
+ #if !TARGET_OS_TV
+    if (@available(iOS 10.3, *))
+    {
++#if TARGET_OS_VISION
++      NSInteger maxFPS = 90;
++#else
+       NSInteger maxFPS = mainScreen.maximumFramesPerSecond;
++#endif
+ 
+       /* ProMotion displays (120Hz) */
+       if (maxFPS >= 120)

@@ -1,0 +1,24 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/FrameBuffer.cpp b/cores/mupen64plus-next/GLideN64/src/FrameBuffer.cpp
+--- a/cores/mupen64plus-next/GLideN64/src/FrameBuffer.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/FrameBuffer.cpp
+@@ -269,6 +269,20 @@
+ 	} else
+ 		_setAndAttachTexture(m_FBO, m_pTexture, 0, false);
+ 
+ //	gfxContext.clearColorBuffer(0.0f, 0.0f, 0.0f, 0.0f);
++	/* 0046: zero the colour attachment we just allocated.
++	 *
++	 * glTexImage2D(..., nullptr) leaves undefined contents, and
++	 * FrameBufferList::renderBuffer() blits the WHOLE internal texture to the
++	 * screen — so every pixel the game never draws to is presented as whatever
++	 * was in that VRAM. On ANGLE/Metal (visionOS) that is the rainbow noise
++	 * The tester sees in the side bars of the core's own framebuffer, before
++	 * RetroArch touches the frame. Upstream's clear on the line above is
++	 * commented out; restore it. clearColorBuffer() disables the scissor test
++	 * itself, so this covers the whole attachment, and it costs one clear per
++	 * framebuffer allocation, not per frame. Must hold in EVERY aspect mode:
++	 * a mode that does not fill the screen shows black bars, never noise. */
++	gfxContext.bindFramebuffer(bufferTarget::DRAW_FRAMEBUFFER, m_FBO);
++	gfxContext.clearColorBuffer(0.0f, 0.0f, 0.0f, 0.0f);
+ }
+ 

@@ -1,0 +1,48 @@
+diff --git a/cores/mesen/Libretro/libretro.cpp b/cores/mesen/Libretro/libretro.cpp
+--- a/cores/mesen/Libretro/libretro.cpp
++++ b/cores/mesen/Libretro/libretro.cpp
+@@ -721,7 +721,43 @@
+ 		_console->GetSoundMixer()->UploadAudioSamples();
+ 	}
+ 
+-	RETRO_API size_t retro_serialize_size()
++/* ---- RA3D scene stream (M1) ----------------------------------------------
++ * mesen_ra3d_get_planes (above) says what the frame LOOKS like; this says what
++ * is IN it: one entry per 8x8 cell on screen, carrying the cell's CHR tile (by index
++ * into a per-frame atlas of raw 16-byte tiles), its screen position, its depth
++ * class, its palette, its flips, and — for sprites — its OAM index, which is
++ * the identity that lets a 3D renderer keep an object's geometry attached to
++ * it as it moves.  See Core/PPU.h for the two structs and gen-patch-0059.py
++ * for how they are captured.
++ *
++ * Capture is OFF until set_scene_enabled(1); a 2D session pays nothing. */
++extern "C" void mesen_ra3d_set_scene_enabled(int enabled)
++{
++	if(!_console) return;
++	PPU *ppu = _console->GetPpu();
++	if(ppu) ppu->SetRA3DSceneEnabled(enabled != 0);
++}
++
++/* Lets a frontend distinguish "core has no scene stream" (dlsym fails) from
++ * "it has one but has not published a frame yet" (this returns 1, get_scene
++ * returns 0). Deliberately usable before a game is loaded. */
++extern "C" int mesen_ra3d_scene_supported(void)
++{
++	return 1;
++}
++
++/* Fills *out with the most recently published frame; 0 if none has been.
++ * The pointers inside belong to the core and are valid until the frame after
++ * next — same double-buffer contract as the planes. */
++extern "C" int mesen_ra3d_get_scene(Ra3dScene *out)
++{
++	if(!out || !_console) return 0;
++	PPU *ppu = _console->GetPpu();
++	if(!ppu) return 0;
++	return ppu->GetRA3DScene(out) ? 1 : 0;
++}
++
++	RETRO_API size_t retro_serialize_size()
+ 	{
+ 		return _saveStateSize;
+ 	}

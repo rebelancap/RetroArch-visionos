@@ -1,0 +1,230 @@
+diff --git a/cores/mesen/Core/PPU.cpp b/cores/mesen/Core/PPU.cpp
+index 3692210..b8748e1 100644
+--- a/cores/mesen/Core/PPU.cpp
++++ b/cores/mesen/Core/PPU.cpp
+@@ -841,6 +841,12 @@ uint8_t PPU::GetPixelColor()
+ 				}
+ 
+ 				if(spriteColor != 0) {
++					/* RA3D: remember this sprite pixel and whether it draws in
++					 * front of the background, independent of which one the NES
++					 * ends up showing. */
++					_ra3dSprPixel   = _lastSprite->PaletteOffset + spriteColor;
++					_ra3dSprInFront = !_spriteTiles[i].BackgroundPriority;
++
+ 					//First sprite without a 00 color, use it.
+ 					if(i == 0 && spriteBgColor != 0 && _sprite0Visible && _cycle != 256 && _flags.BackgroundEnabled && !_statusFlags.Sprite0Hit && _cycle > _minimumDrawSpriteStandardCycle) {
+ 						//"The hit condition is basically sprite zero is in range AND the first sprite output unit is outputting a non-zero pixel AND the background drawing unit is outputting a non-zero pixel."
+@@ -862,12 +868,45 @@ uint8_t PPU::GetPixelColor()
+ 	return ((offset + ((_cycle - 1) & 0x07) < 8) ? _previousTile : _currentTile).PaletteOffset + backgroundColor;
+ }
+ 
++/* RA3D: the background palette index for this pixel, evaluated exactly as
++ * GetPixelColor() does but ignoring sprites entirely — so the background plane
++ * has no sprite-shaped holes in it. */
++uint8_t PPU::GetBackgroundPixelColor()
++{
++	uint8_t offset = _state.XScroll;
++	uint8_t backgroundColor = 0;
++	if(_cycle > _minimumDrawBgCycle && _settings->GetBackgroundEnabled()) {
++		backgroundColor = (((_state.LowBitShift << offset) & 0x8000) >> 15) | (((_state.HighBitShift << offset) & 0x8000) >> 14);
++	}
++	return ((offset + ((_cycle - 1) & 0x07) < 8) ? _previousTile : _currentTile).PaletteOffset + backgroundColor;
++}
++
+ void PPU::DrawPixel()
+ {
+ 	//This is called 3.7 million times per second - needs to be as fast as possible.
+ 	if(IsRenderingEnabled() || ((_state.VideoRamAddr & 0x3F00) != 0x3F00)) {
++		_ra3dSprPixel = RA3D_TRANSPARENT;
+ 		uint32_t color = GetPixelColor();
+-		_currentOutputBuffer[(_scanline << 8) + _cycle - 1] = _paletteRAM[color & 0x03 ? color : 0];
++		int32_t ra3dIdx = (_scanline << 8) + _cycle - 1;
++		_currentOutputBuffer[ra3dIdx] = _paletteRAM[color & 0x03 ? color : 0];
++
++		/* RA3D layer split — the same pixel, decomposed. */
++		{
++			uint32_t bg = GetBackgroundPixelColor();
++			/* Colour 0 in any palette means TRANSPARENT on the NES — the
++			 * backdrop shows there, and so does any behind-priority sprite.
++			 * Marking those pixels transparent instead of painting them the
++			 * backdrop colour is what lets the depth stack reproduce the
++			 * hardware priority rule for every game. */
++			_ra3dLayer[0][ra3dIdx] = (bg & 0x03) ? _paletteRAM[bg] : RA3D_TRANSPARENT;
++			_ra3dLayer[1][ra3dIdx] = RA3D_TRANSPARENT;
++			_ra3dLayer[2][ra3dIdx] = RA3D_TRANSPARENT;
++			/* Backdrop: opaque, farthest, so something always fills the frame. */
++			_ra3dLayer[3][ra3dIdx] = _paletteRAM[0];
++			if(_ra3dSprPixel != RA3D_TRANSPARENT && _settings->GetSpritesEnabled()) {
++				_ra3dLayer[_ra3dSprInFront ? 1 : 2][ra3dIdx] = _paletteRAM[_ra3dSprPixel & 0x03 ? _ra3dSprPixel : 0];
++			}
++		}
+ 	} else {
+ 		//"If the current VRAM address points in the range $3F00-$3FFF during forced blanking, the color indicated by this palette location will be shown on screen instead of the backdrop color."
+ 		_currentOutputBuffer[(_scanline << 8) + _cycle - 1] = _paletteRAM[_state.VideoRamAddr & 0x1F];
+@@ -1158,6 +1197,26 @@ void PPU::SendFrame()
+ {
+ 	UpdateGrayscaleAndIntensifyBits();
+ 
++	/* RA3D: publish this frame's depth planes as ARGB.  The conversion uses the
++	 * console's own RGB palette, so plane colours match what the normal 2D
++	 * output shows pixel for pixel.  Written into the half the reader is not
++	 * holding, then the index is released — the frontend can only ever see a
++	 * complete frame. */
++	{
++		uint32_t *pal = _settings->GetRgbPalette();
++		int write = (_ra3dReadIdx.load(std::memory_order_relaxed) == 0) ? 1 : 0;
++		for(int plane = 0; plane < RA3D_PLANES; plane++) {
++			const uint16_t *src = _ra3dLayer[plane];
++			uint32_t *dst = _ra3dPublished[write][plane];
++			for(int i = 0; i < 256*240; i++) {
++				uint16_t v = src[i];
++				dst[i] = (v == RA3D_TRANSPARENT) ? 0u : (pal[v & 0x1FF] | 0xFF000000u);
++			}
++		}
++		_ra3dFrame.fetch_add(1, std::memory_order_relaxed);
++		_ra3dReadIdx.store(write, std::memory_order_release);
++	}
++
+ 	_console->GetVideoDecoder()->UpdateFrameSync(_currentOutputBuffer);
+ #if 0
+ 	_enableOamDecay = _settings->CheckFlag(EmulationFlags::EnableOamDecay);
+diff --git a/cores/mesen/Core/PPU.h b/cores/mesen/Core/PPU.h
+index 55c3182..9817f2a 100644
+--- a/cores/mesen/Core/PPU.h
++++ b/cores/mesen/Core/PPU.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <atomic>
+ 
+ #include "stdafx.h"
+ #include "Snapshotable.h"
+@@ -49,6 +50,36 @@ class PPU : public IMemoryHandler, public Snapshotable
+ 		uint16_t *_currentOutputBuffer;
+ 		uint16_t *_outputBuffers[2];
+ 
++		/* --- RA3D layer split -------------------------------------------------
++		 * The NES composes every pixel from a background plane and a sprite
++		 * plane, and GetPixelColor() already evaluates BOTH before choosing one.
++		 * Capturing them separately therefore costs no extra emulation: the
++		 * frontend gets the SAME frame as three images it can place at
++		 * different depths.  Planes, far to near:
++		 *   3 = backdrop (universal colour, opaque, farthest)
++		 *   2 = sprites BEHIND the background (per-sprite priority bit)
++		 *   0 = background — TRANSPARENT where the BG pixel is colour 0
++		 *   1 = sprites IN FRONT of the background
++		 * The background MUST be transparent at colour 0: on hardware a
++		 * behind-priority sprite shows through exactly there, and the backdrop
++		 * shows where nothing else draws.  Filling colour 0 with the backdrop
++		 * colour and calling the plane opaque hides every behind-sprite
++		 * permanently (Punch-Out's opponent against the crowd, Mario's sky).
++		 * Working planes hold palette indices; RA3D_TRANSPARENT means nothing
++		 * was drawn (a real NES palette value is 6 bits plus emphasis, so
++		 * 0xFFFF can never collide).  SendFrame() converts them to ARGB and
++		 * publishes into whichever half of _ra3dPublished the reader is not
++		 * holding, so the frontend never samples a half-written frame. */
++		static constexpr uint16_t RA3D_TRANSPARENT = 0xFFFF;
++		static constexpr int      RA3D_PLANES      = 4;
++		uint16_t _ra3dLayer[RA3D_PLANES][256*240];
++		uint32_t _ra3dPublished[2][RA3D_PLANES][256*240];
++		std::atomic<int>      _ra3dReadIdx { -1 };
++		std::atomic<uint32_t> _ra3dFrame   { 0 };
++		uint16_t _ra3dBgPixel;      /* background palette value at this pixel   */
++		uint16_t _ra3dSprPixel;     /* sprite palette value, or TRANSPARENT     */
++		bool     _ra3dSprInFront;   /* sprite priority for this pixel           */
++
+ 		NesModel _nesModel;
+ 		uint16_t _standardVblankEnd;
+ 		uint16_t _standardNmiScanline;
+@@ -151,6 +182,7 @@ class PPU : public IMemoryHandler, public Snapshotable
+ 		void UpdateMinimumDrawCycles();
+ 
+ 		uint8_t GetPixelColor();
++	uint8_t GetBackgroundPixelColor();  /* RA3D layer split */
+ 		__forceinline virtual void DrawPixel();
+ 		void UpdateGrayscaleAndIntensifyBits();
+ 		void UpdateColorBitMasks();
+@@ -187,6 +219,16 @@ class PPU : public IMemoryHandler, public Snapshotable
+ 		void Reset();
+ 
+ 		uint16_t* GetScreenBuffer(bool previousBuffer);
++
++		/* RA3D: the current frame decomposed into depth planes.
++		 * 0 = background, 1 = sprites in front, 2 = sprites behind.
++		 * Values are NES palette entries; RA3D_TRANSPARENT = nothing drawn. */
++		const uint32_t* GetRA3DPlane(int plane)
++		{
++			int idx = _ra3dReadIdx.load(std::memory_order_acquire);
++			return (idx >= 0 && plane >= 0 && plane < RA3D_PLANES) ? _ra3dPublished[idx][plane] : nullptr;
++		}
++		uint32_t GetRA3DFrameCounter() { return _ra3dFrame.load(std::memory_order_acquire); }
+ 		void DebugUpdateFrameBuffer(bool toGrayscale);
+ 		void GetState(PPUDebugState &state);
+ 		void SetState(PPUDebugState &state);
+diff --git a/cores/mesen/Libretro/libretro.cpp b/cores/mesen/Libretro/libretro.cpp
+index 48fa641..ce5ef3c 100644
+--- a/cores/mesen/Libretro/libretro.cpp
++++ b/cores/mesen/Libretro/libretro.cpp
+@@ -7,6 +7,7 @@
+ #include "libretro.h"
+ #include "libretro_core_options.h"
+ #include "../Core/Console.h"
++#include "../Core/PPU.h"
+ #include "../Core/VideoDecoder.h"
+ #include "../Core/VideoRenderer.h"
+ #include "../Core/MemoryManager.h"
+@@ -18,8 +19,8 @@
+ #include "../Core/DebuggerTypes.h"
+ #include "../Core/GameDatabase.h"
+ #include "../Core/SoundMixer.h"
+-#include "../Utilities/FolderUtilities.h"
+ #include "../Utilities/HexUtilities.h"
++#include "../Utilities/FolderUtilities.h"
+ 
+ #define DEVICE_AUTO               RETRO_DEVICE_JOYPAD
+ #define DEVICE_GAMEPAD            RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 0)
+@@ -644,6 +645,44 @@ extern "C" {
+ 		env_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &avInfo);
+ 	}
+ 
++/* ---- RA3D depth planes ---------------------------------------------------
++ * The visionOS shell places the NES picture's layers at different distances so
++ * the scene has real binocular depth.  It reads them straight out of the core
++ * (dlsym on this symbol) rather than through the libretro video callback, so
++ * RetroArch's video path — and therefore ordinary 2D output — is untouched.
++ *
++ * Returns the number of planes, far to near:
++ *   planes[0] = sprites BEHIND the background
++ *   planes[1] = background
++ *   planes[2] = sprites IN FRONT of the background
++ * Buffers are 256x240 ARGB8888, alpha 0 where nothing was drawn, owned by the
++ * core and valid until the next call.  frame_counter increments per emulated
++ * frame so the caller can skip re-uploading an unchanged frame. */
++extern "C" int mesen_ra3d_get_planes(const uint32_t **planes, unsigned *width,
++                                     unsigned *height, uint32_t *frame_counter,
++                                     float *display_aspect)
++{
++	if(!planes || !_console) return 0;
++	PPU *ppu = _console->GetPpu();
++	if(!ppu) return 0;
++	/* Core plane order is 0=bg, 1=front, 2=behind; hand it back sorted by depth. */
++	/* Hand them back sorted by depth, far to near:
++	 *   backdrop, sprites-behind, background, sprites-front */
++	static const int order[4] = { 3, 2, 0, 1 };
++	for(int i = 0; i < 4; i++) {
++		planes[i] = ppu->GetRA3DPlane(order[i]);
++		if(!planes[i]) return 0;
++	}
++	if(width)  *width  = 256;
++	if(height) *height = 240;
++	if(frame_counter) *frame_counter = ppu->GetRA3DFrameCounter();
++	/* Mesen's own reported aspect: NES pixels are not square and the region
++	 * (NTSC 8:7 vs PAL) changes it, so let the core state it rather than have
++	 * the shell guess or inherit the frontend's. 0 = shell falls back. */
++	if(display_aspect) *display_aspect = 0.0f;
++	return 4;
++}
++
+ 	RETRO_API void retro_run()
+ 	{
+ 		if(_console->GetSettings()->CheckFlag(EmulationFlags::ForceMaxSpeed)) {

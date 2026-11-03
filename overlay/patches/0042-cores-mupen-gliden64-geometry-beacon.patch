@@ -1,0 +1,85 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp
+index 5762a7e..67dfffe 100644
+--- a/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/Graphics/OpenGLContext/mupen64plus/mupen64plus_DisplayWindow.cpp
+@@ -13,6 +13,10 @@
+ #include <FrameBuffer.h>
+ #include <GLideNUI/GLideNUI.h>
+ #include <DisplayWindow.h>
++#include <dlfcn.h>   /* 0042: RA_BeaconMark lives in the host */
++#include <fcntl.h>   /* 0042/: ...but ThinLTO hides it - write it ourselves */
++#include <unistd.h>
++#include <time.h>
+ 
+ #include <libretro_private.h>
+ #include <mupen64plus-next_common.h>
+@@ -76,6 +80,69 @@ bool DisplayWindowMupen64plus::_start()
+ 	_getDisplaySize();
+ 	_setBufferSize();
+ 
++	/* 0042: one beacon line carrying every value that decides the output
++	 * rectangle, at the single point where all of them have landed. The tester sees
++	 * a letterbox on device that this core does not produce in the mac harness
++	 * so the disagreement is in one of
++	 * these numbers. aspect: 0=stretch 1=4:3 2=16:9 3=adjust4:3 4=adjust16:9
++	 * (Config.h).
++	 *
++	 * the first cut of this beacon resolved RetroArch's RA_BeaconMark via
++	 * dlsym(RTLD_DEFAULT) and printed nothing on device. The frontend is built
++	 * with LLVM_LTO=YES_THIN, and ThinLTO *internalizes* any symbol the final
++	 * executable link does not need externally: `nm -m RetroArch` reports
++	 * `_RA_BeaconMark ... non-external (was a private external)`, so the dlsym
++	 * always returned NULL and shipped a core whose beacon could never
++	 * fire. Never depend on a symbol in an LTO'd executable from a dylib: keep
++	 * the dlsym as the preferred path (it timestamps into the same log through
++	 * the host) but fall back to writing the identical line to
++	 * $HOME/Documents/launch-beacon.log ourselves, with pure POSIX. On the mac
++	 * harness HOME/Documents exists too, so the fallback is harmless there. */
++	{
++		static void (*ra_beacon)(const char *) = NULL;
++		static bool ra_beacon_looked_up = false;
++		if (!ra_beacon_looked_up) {
++			ra_beacon_looked_up = true;
++			ra_beacon = (void (*)(const char *))dlsym(RTLD_DEFAULT, "RA_BeaconMark");
++		}
++		{
++			char m[256];
++			snprintf(m, sizeof(m),
++				"gliden64 wnd: screen=%ux%u buf=%ux%u adjust=%d scale=%.4f "
++				"aspect=%d nativeres=%u overscan=%d scaleXY=%.3f/%.3f threaded=%u",
++				m_screenWidth, m_screenHeight, m_width, m_height,
++				m_bAdjustScreen ? 1 : 0, m_adjustScale,
++				(int)config.frameBufferEmulation.aspect,
++				config.frameBufferEmulation.nativeResFactor,
++				config.frameBufferEmulation.enableOverscan ? 1 : 0,
++				m_scaleX, m_scaleY, (unsigned)EnableThreadedRenderer);
++			if (ra_beacon != NULL) {
++				ra_beacon(m);
++			} else {
++				const char *home = getenv("HOME");
++				if (home != NULL) {
++					char path[1024];
++					snprintf(path, sizeof(path),
++						"%s/Documents/launch-beacon.log", home);
++					int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
++					if (fd >= 0) {
++						time_t tt = time(NULL);
++						struct tm tmv;
++						char line[512];
++						localtime_r(&tt, &tmv);
++						int n = snprintf(line, sizeof(line),
++							"%04d-%02d-%02d %02d:%02d:%02d  %s\n",
++							tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
++							tmv.tm_hour, tmv.tm_min, tmv.tm_sec, m);
++						if (n > 0)
++							(void)write(fd, line, (size_t)n);
++						close(fd);
++					}
++				}
++			}
++		}
++	}
++
+ #ifdef EGL
+ 	eglInitialize(eglGetDisplay(EGL_DEFAULT_DISPLAY), nullptr, nullptr);
+ #endif // EGL

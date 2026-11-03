@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""Generate overlay/patches/0033-visionos-frame-loop-pacing.patch (r3).
+
+r3: the accumulator is clamped to two periods right
+after `+= dt`, so a stall yields at most one catch-up frame.
+
+0033 was hand-written in round (telemetry + vsync-off free-running loop +
+the launch-race latch). r2 adds TIME-BASED PACING and this
+generator, so the patch can be revised the overlay way from now on.
+
+THE BUG (the tester,, 2026-10-18): every game in slow motion with slow,
+low-quality audio. The device beacon: the display link was asked
+for [60..60] (dispserv_apple sets preferredFramesPerSecond = video_refresh_rate,
+which on xros is the iOS-15 range [60..60]); with the panel at 120 Hz it fired
+every 2nd vsync = 60/s, but from 22:08:53 on the system ran the panel at 90 Hz,
+where [60..60] means every 2nd vsync = 45/s. r1 ran exactly one
+runloop_iterate() per callback -> 45 fps = 75 % speed, audio_sat=0 %.
+
+THE FIX: ask for every vsync ([60..120 pref 120], re-asserted per tick because
+dispserv rewrites it at each video init), and run frames from an accumulator on
+target.timestamp at the virtual rate RetroArch's own audio rate control assumes
+(mirror of driver_adjust_system_rates), max one catch-up frame per tick, at most
+one frame of debt. cocoa_get_refresh_rate() on visionOS reports that virtual
+rate (video_refresh_rate) instead of the link's preferred rate, which is now the
+panel's. Free mode (vsync off) and the observer path are unchanged.
+
+Dev hooks: RA_PACE_FORCE_HZ=<n> -> request [n..n]; RA_PACE_LEGACY=1 -> r1.
+
+Workflow: 0033 must be OUT of vendor (patch -p1 -R it first); this asserts every
+anchor against the pre-0033 text (0008/0024 applied), writes the patch with
+difflib, and dry-runs it. Run from the repo root.
+"""
+import difflib
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+REL = "ui/drivers/cocoa/cocoa_common.m"
+SRC = ROOT / "vendor/RetroArch" / REL
+OUT = ROOT / "overlay/patches/0033-visionos-frame-loop-pacing.patch"
+
+BLOCK = r'''#endif
+
+/* ---------------------------------------------------------------------------
+ * 0033: visionOS frame-loop pacing telemetry + optional free-running loop.
+ *
+ * Upstream runs exactly ONE runloop_iterate() per CADisplayLink tick, so an
+ * iteration longer than one tick period (11.1ms @90Hz, 8.3ms @120Hz) skips a
+ * tick and the game drops to half rate. This block (a) measures that, and
+ * (b) offers the macOS-style free-running loop (observer re-armed every
+ * iteration, paced by audio sync) behind the existing Vertical Sync setting.
+ * Telemetry is one RA_BeaconMark line every 2s; per-tick cost is a handful of
+ * integer/float ops with no allocation and no logging.
+ *
+ * r2: emulation is paced by TIME, not by display refresh.
+ * r1 ran one runloop_iterate() per display-link callback, and the link was
+ * asked for [60..60] (dispserv_apple sets preferredFramesPerSecond from
+ * video_refresh_rate). That is 60 fps only while the panel runs at a multiple
+ * of 60. visionOS also runs it at 90 and 100 Hz; there a [60..60] link fires
+ * every 2nd vsync = 45 / 50 per second, and the game plays at 75 % / 83 %
+ * speed with a starved, resampled audio buffer (device beacon:
+ * hz_granted=90.0 tick_avg_ms=22.22 fps=45.1 audio_sat=0%).
+ * r2 asks for EVERY vsync (RA_PACE_RANGE_*) and runs frames from an
+ * accumulator on target.timestamp: one runloop_iterate() per elapsed virtual
+ * frame period, on the vsync nearest the ideal time. Extra (catch-up) frames
+ * in one callback only while this callback's iterates have used under half
+ * the callback interval, at most RA_PACE_MAX_RUNS, and never more than one
+ * frame of debt carried (overload = slow, never a spiral). While the audio
+ * buffer is over 75 % full, audio sync is the master clock (as on every other
+ * RetroArch platform): no catch-up frames and no debt — otherwise time spent
+ * blocked in the audio write would be "repaid" with more audio, and the two
+ * clocks would fight (seen in the simulator). 60 fps content: 1:2 at 120 Hz, 2:3 at 90, 3:5 at 100, 1:1 at 60.
+ * The virtual rate (ra_pace_virtual_hz) mirrors driver_adjust_system_rates(),
+ * i.e. the rate RetroArch's audio resampler already assumes the game runs at,
+ * so cadence and audio agree and dynamic rate control only absorbs drift.
+ * Dev hooks: RA_PACE_FORCE_HZ=<n> requests [n..n] (simulator grant tests);
+ * RA_PACE_LEGACY=1 restores r1's one-iterate-per-callback for A/B.
+ * ------------------------------------------------------------------------- */
+#if TARGET_OS_VISION
+#include <stdlib.h>
+#include <math.h>
+#include <mach/mach_time.h>
+#include "../../audio/audio_driver.h"
+#include "../../gfx/video_driver.h"
+#include "../../runloop.h"
+
+extern void RA_BeaconMark(const char *stage);
+
+/* One-shot latch: false until rarch_main() has returned. CocoaView and its
+ * CADisplayLink are built in the host's -viewDidLoad, but on the SwiftUI shell
+ * rarch_main only runs later, from -viewDidAppear. Any tick landing in that gap
+ * used to call runloop_iterate() on an uninitialised frontend and segfault —
+ * intermittent by timing, and the reason launches sometimes needed several
+ * tries. Upstream iOS cannot hit this: there, rarch_main runs before any view
+ * exists. Set from ui_cocoatouch.m's launch body (overlay 0034); never cleared,
+ * because a content close or menu return must keep iterating. */
+static bool     ra_pace_frontend_ready;
+
+void ra_vision_mark_frontend_ready(void) { ra_pace_frontend_ready = true; }
+
+/* true while the free-running (vsync=off) loop owns iteration */
+static bool     ra_pace_free;
+/* set once the first granted CADisplayLink duration has been logged */
+static bool     ra_pace_announced;
+static double   ra_pace_last_ts;      /* previous target.timestamp (seconds)  */
+static double   ra_pace_dur;          /* last granted target.duration          */
+static double   ra_pace_win_start;    /* timestamp the current 2s window began */
+static double   ra_pace_tick_accum;   /* summed tick deltas this window        */
+static unsigned ra_pace_ticks;
+static unsigned ra_pace_skips;
+static unsigned ra_pace_iters;
+static double   ra_pace_iter_accum;   /* summed iterate() ms this window       */
+static double   ra_pace_iter_max;
+#define RA_PACE_MAX_SAMPLES 600
+static float    ra_pace_iter_ms[RA_PACE_MAX_SAMPLES];
+static unsigned ra_pace_iter_n;
+/* Swap-time split: how much of an iterate() is spent blocked inside the GLES
+ * context's eglSwapBuffers (waiting on the compositor) rather than doing real
+ * emulation and render work. Fed by cocoa_angle_ctx.m. */
+/* r2 time-based pacing state (see header) */
+#define RA_PACE_RANGE_MIN  60.0f
+#define RA_PACE_RANGE_MAX  120.0f
+#define RA_PACE_MAX_RUNS   3
+static double   ra_pace_accum;        /* emulated seconds owed (<= 2 periods)  */
+static double   ra_pace_due_ts;       /* timestamp of the last accumulator tick */
+static double   ra_pace_virt_hz = 60.0; /* virtual frame rate being paced to   */
+static double   ra_pace_last_ms;      /* cost of the latest iterate()          */
+static double   ra_pace_tick_dt;      /* seconds since the previous callback   */
+static unsigned ra_pace_runs;         /* accumulator-driven iterates in window */
+static unsigned ra_pace_catchups;     /* of which: 2nd iterate in one tick     */
+static unsigned ra_pace_audio_ahead_n;/* ticks where audio was the master      */
+static unsigned ra_pace_range_sets;   /* times the link range was (re)asserted */
+static int      ra_pace_force_hz = -1;/* RA_PACE_FORCE_HZ, -1 = not read yet   */
+static int      ra_pace_legacy   = -1;/* RA_PACE_LEGACY,   -1 = not read yet   */
+static double   ra_pace_swap_accum;
+static double   ra_pace_swap_max;
+static unsigned ra_pace_swap_n;
+
+static double ra_pace_mach_ms(uint64_t delta)
+{
+   static double scale;
+   if (scale == 0.0)
+   {
+      mach_timebase_info_data_t tb;
+      mach_timebase_info(&tb);
+      scale = (double)tb.numer / (double)tb.denom / 1.0e6; /* ticks -> ms */
+   }
+   return (double)delta * scale;
+}
+
+/* Called by the ANGLE context around egl_swap_buffers; always nested inside a
+ * runloop_iterate() we are already timing. Not static: cocoa_angle_ctx.m calls
+ * it, and keeping the mach timebase in one place keeps the units honest. */
+void ra_pace_swap_note(uint64_t mach_delta)
+{
+   double ms = ra_pace_mach_ms(mach_delta);
+   ra_pace_swap_accum += ms;
+   if (ms > ra_pace_swap_max)
+      ra_pace_swap_max = ms;
+   ra_pace_swap_n++;
+}
+
+/* runloop_iterate() with per-call timing. Used by BOTH iteration sources so
+ * the numbers mean the same thing in dl and free mode. */
+static int ra_pace_iterate(void)
+{
+   uint64_t t0  = mach_absolute_time();
+   int      ret = runloop_iterate();
+   double   ms  = ra_pace_mach_ms(mach_absolute_time() - t0);
+   ra_pace_iters++;
+   ra_pace_last_ms     = ms;
+   ra_pace_iter_accum += ms;
+   if (ms > ra_pace_iter_max)
+      ra_pace_iter_max = ms;
+   if (ra_pace_iter_n < RA_PACE_MAX_SAMPLES)
+      ra_pace_iter_ms[ra_pace_iter_n++] = (float)ms;
+   return ret;
+}
+
+static void ra_pace_window_reset(double ts)
+{
+   ra_pace_win_start   = ts;
+   ra_pace_tick_accum  = 0.0;
+   ra_pace_ticks       = 0;
+   ra_pace_skips       = 0;
+   ra_pace_iters       = 0;
+   ra_pace_iter_accum  = 0.0;
+   ra_pace_iter_max    = 0.0;
+   ra_pace_iter_n      = 0;
+   ra_pace_swap_accum  = 0.0;
+   ra_pace_swap_max    = 0.0;
+   ra_pace_swap_n      = 0;
+   ra_pace_runs        = 0;
+   ra_pace_catchups    = 0;
+   ra_pace_audio_ahead_n = 0;
+}
+
+/* Audio buffer over 75 % full with audio sync on: the audio clock is ahead
+ * of (or slower than) ours and audio sync is about to block — let it lead.
+ * Same write_avail/buffer_size pair the DRC reads; cheap on CoreAudio. */
+static bool ra_pace_audio_ahead(void)
+{
+   settings_t           *settings = config_get_ptr();
+   audio_driver_state_t *a        = audio_state_get_ptr();
+   size_t                avail;
+   if (   !settings || !settings->bools.audio_sync
+       || !a || !(a->flags & AUDIO_FLAG_ACTIVE) || !a->current_audio
+       || !a->current_audio->write_avail || !a->context_audio_data
+       || a->buffer_size == 0)
+      return false;
+   avail = a->current_audio->write_avail(a->context_audio_data);
+   return avail < a->buffer_size / 4;
+}
+
+/* The frame rate RetroArch itself believes the game runs at. Mirrors
+ * retroarch.c driver_adjust_system_rates(): when the core's fps is within
+ * audio_max_timing_skew of the configured refresh (or of refresh / swap
+ * interval), audio is resampled as if the game ran at exactly that rate, so
+ * frames must be issued at that rate too. Otherwise the core's own fps. At
+ * the menu: the configured refresh. Never the granted panel rate. */
+static double ra_pace_virtual_hz(void)
+{
+   settings_t           *settings = config_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   double refresh  = settings ? settings->floats.video_refresh_rate : 60.0;
+   double core_fps = video_st ? video_st->av_info.timing.fps : 0.0;
+
+   if (refresh < 10.0 || refresh > 250.0)
+      refresh = 60.0;
+   if (   !settings
+       || !(runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING)
+       || core_fps < 10.0 || core_fps > 250.0)
+      return refresh;
+   if (!settings->bools.vrr_runloop_enable)
+   {
+      double   target = refresh;
+      unsigned mult   = (unsigned)(refresh / core_fps + 0.5);
+      if (mult > 1)
+      {
+         unsigned sub  = settings->uints.video_shader_subframes;
+         unsigned swap = runloop_get_video_swap_interval(
+               settings->uints.video_swap_interval);
+         target /= ((double)settings->uints.video_black_frame_insertion + 1.0)
+                 * (double)(swap ? swap : 1) * (double)(sub ? sub : 1);
+      }
+      if (fabs(1.0 - core_fps / target) <= settings->floats.audio_max_timing_skew)
+         return target;
+   }
+   return core_fps;
+}
+
+static void ra_pace_read_env(void)
+{
+   const char *e;
+   if (ra_pace_force_hz >= 0)
+      return;
+   e                = getenv("RA_PACE_FORCE_HZ");
+   ra_pace_force_hz = (e && atoi(e) >= 10 && atoi(e) <= 240) ? atoi(e) : 0;
+   e                = getenv("RA_PACE_LEGACY");
+   ra_pace_legacy   = (e && *e && *e != '0') ? 1 : 0;
+}
+
+/* Ask for every vsync. dispserv_apple (re)sets preferredFramesPerSecond =
+ * video_refresh_rate at every video init / refresh change, which on visionOS
+ * becomes [60..60]; re-asserting here, per tick, keeps one owner without
+ * patching each call site. One compare per tick when nothing changed. */
+static void ra_pace_assert_range(CADisplayLink *link)
+{
+   CAFrameRateRange want, was;
+   char msg[200];
+   ra_pace_read_env();
+   if (ra_pace_legacy)
+      return;
+   want = ra_pace_force_hz
+        ? CAFrameRateRangeMake((float)ra_pace_force_hz, (float)ra_pace_force_hz,
+                               (float)ra_pace_force_hz)
+        : CAFrameRateRangeMake(RA_PACE_RANGE_MIN, RA_PACE_RANGE_MAX, RA_PACE_RANGE_MAX);
+   was  = link.preferredFrameRateRange;
+   if (CAFrameRateRangeIsEqualToRange(was, want))
+      return;
+   link.preferredFrameRateRange = want;
+   if (ra_pace_range_sets++ < 16)
+   {
+      snprintf(msg, sizeof(msg),
+            "pace displaylink range set [%.1f..%.1f pref %.1f] (was [%.1f..%.1f pref %.1f])%s",
+            want.minimum, want.maximum, want.preferred,
+            was.minimum, was.maximum, was.preferred,
+            ra_pace_force_hz ? " RA_PACE_FORCE_HZ" : "");
+      RA_BeaconMark(msg);
+   }
+}
+
+/* How many iterates this tick owes: 0 .. RA_PACE_MAX_RUNS. */
+static unsigned ra_pace_due(double ts, double dur)
+{
+   double   period, dt, tol;
+   unsigned n = 0;
+
+   ra_pace_read_env();
+   ra_pace_virt_hz = ra_pace_virtual_hz();
+   if (ra_pace_legacy)
+      return 1;
+   period = 1.0 / ra_pace_virt_hz;
+   dt     = (ra_pace_due_ts > 0.0 && ts > ra_pace_due_ts) ? (ts - ra_pace_due_ts) : period;
+   ra_pace_due_ts  = ts;
+   ra_pace_tick_dt = dt;
+   /* Back from background / a long load: resume, do not replay the gap. */
+   if (dt > 0.25)
+      dt = period;
+   ra_pace_accum += dt;
+   /* r3: at most ONE catch-up frame per tick. A 50-250 ms
+    * stall (content load, menu close) used to run 3 frames here plus 1-2 on
+    * the next tick: a 3-5 frame fast-forward blip. Two periods, not one: a
+    * tick that legitimately spans two frames (30 callbacks/s, the simulator's
+    * ImmersiveSpace link) must still run both, or it plays at half speed. */
+   if (ra_pace_accum > 2.0 * period)
+      ra_pace_accum = 2.0 * period;
+   /* Fire on the vsync nearest the ideal frame time (half a tick early, plus
+    * 0.2 ms so 60-on-90's exact 1.5-tick ties resolve the same way every time). */
+   tol = 0.5 * ((dur > 0.0 && dur < period) ? dur : period) + 0.0002;
+   if (ra_pace_audio_ahead())
+   {
+      /* audio leads: at most one frame per tick, on schedule; no debt kept
+       * beyond the normal half-tick phase, so time lost blocked in the audio
+       * write is never repaid with extra frames */
+      ra_pace_audio_ahead_n++;
+      if (ra_pace_accum >= period - tol)
+      {
+         ra_pace_accum -= period;
+         n = 1;
+      }
+      /* after a run, on-schedule phase is < tol; anything above is backlog */
+      if (n == 1 && ra_pace_accum > tol)
+         ra_pace_accum = tol;
+      return n;
+   }
+   while (n < RA_PACE_MAX_RUNS && ra_pace_accum >= period - tol)
+   {
+      ra_pace_accum -= period;
+      n++;
+   }
+   if (ra_pace_accum > period)
+      ra_pace_accum = period;
+   return n;
+}
+
+/* The tick could not afford a catch-up frame: keep it owed (still capped). */
+static void ra_pace_owe(void)
+{
+   double period  = 1.0 / ra_pace_virt_hz;
+   ra_pace_accum += period;
+   if (ra_pace_accum > period)
+      ra_pace_accum = period;
+}
+
+static int ra_pace_cmp_f(const void *a, const void *b)
+{
+   float fa = *(const float*)a, fb = *(const float*)b;
+   return (fa > fb) - (fa < fb);
+}
+
+/* Per-tick bookkeeping. Cheap: two compares and three adds. */
+static void ra_pace_tick(double ts, double dur)
+{
+   if (ra_pace_last_ts > 0.0 && ts > ra_pace_last_ts)
+   {
+      double d = ts - ra_pace_last_ts;
+      ra_pace_tick_accum += d;
+      ra_pace_ticks++;
+      if (dur > 0.0 && d > dur * 1.5)
+         ra_pace_skips++;
+   }
+   ra_pace_last_ts = ts;
+   if (dur > 0.0)
+      ra_pace_dur = dur;
+}
+
+/* One summary line every 2s while a core is running. */
+static void ra_pace_report(double ts)
+{
+   char     msg[448];
+   double   hz, tick_ms, iter_avg, p95, fps, swap_avg, win, core_fps;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   float    sat;
+   double   refresh = 0.0, deviation = 0.0;
+   unsigned samples = 0;
+   audio_statistics_t astats;
+
+   if (ra_pace_win_start == 0.0)
+   {
+      ra_pace_window_reset(ts);
+      return;
+   }
+   if (!(runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING))
+   {
+      ra_pace_window_reset(ts);
+      return;
+   }
+   if (ts - ra_pace_win_start < 2.0)
+      return;
+
+   hz       = (ra_pace_dur > 0.0) ? (1.0 / ra_pace_dur) : 0.0;
+   tick_ms  = ra_pace_ticks ? (ra_pace_tick_accum * 1000.0 / ra_pace_ticks) : 0.0;
+   iter_avg = ra_pace_iters ? (ra_pace_iter_accum / ra_pace_iters) : 0.0;
+   p95      = 0.0;
+   if (ra_pace_iter_n > 0)
+   {
+      unsigned idx;
+      qsort(ra_pace_iter_ms, ra_pace_iter_n, sizeof(float), ra_pace_cmp_f);
+      idx = (unsigned)((ra_pace_iter_n * 95) / 100);
+      if (idx >= ra_pace_iter_n)
+         idx = ra_pace_iter_n - 1;
+      p95 = ra_pace_iter_ms[idx];
+   }
+   swap_avg = ra_pace_swap_n ? (ra_pace_swap_accum / ra_pace_swap_n) : 0.0;
+   fps = video_monitor_fps_statistics(&refresh, &deviation, &samples) ? refresh : 0.0;
+   sat = audio_compute_buffer_statistics(&astats) ? astats.average_buffer_saturation : -1.0f;
+   win      = ts - ra_pace_win_start;
+   core_fps = video_st ? video_st->av_info.timing.fps : 0.0;
+
+   snprintf(msg, sizeof(msg),
+         "pace mode=%s hz_granted=%.1f tick_avg_ms=%.2f skipped=%u/%u iters=%u "
+         "iter_ms avg=%.1f max=%.1f p95=%.1f swap_ms avg=%.1f max=%.1f n=%u "
+         "fps=%.1f audio_sat=%.0f%% core_fps=%.3f virt_hz=%.3f runs_per_s=%.1f catchup=%u audio_lead=%u%s",
+         ra_pace_free ? "free" : "dl", hz, tick_ms,
+         ra_pace_skips, ra_pace_ticks, ra_pace_iters,
+         iter_avg, ra_pace_iter_max, p95,
+         swap_avg, ra_pace_swap_max, ra_pace_swap_n, fps, sat,
+         core_fps, ra_pace_virt_hz, win > 0.0 ? ra_pace_runs / win : 0.0,
+         ra_pace_catchups, ra_pace_audio_ahead_n, ra_pace_legacy == 1 ? " LEGACY" : "");
+   RA_BeaconMark(msg);
+   ra_pace_window_reset(ts);
+}
+
+/* Once, at the first tick: what we asked the display link for vs what we got. */
+static void ra_pace_announce(CADisplayLink *link, double dur)
+{
+   char msg[192];
+   if (ra_pace_announced || dur <= 0.0)
+      return;
+   ra_pace_announced = true;
+   snprintf(msg, sizeof(msg),
+         "pace displaylink requested=[%.1f..%.1f pref %.1f] granted_duration=%.4fs (%.1f Hz)",
+         link.preferredFrameRateRange.minimum,
+         link.preferredFrameRateRange.maximum,
+         link.preferredFrameRateRange.preferred,
+         dur, 1.0 / dur);
+   RA_BeaconMark(msg);
+}
+
+#define RA_PACE_ITERATE()    ra_pace_iterate()
+#define RA_PACE_FREE_ACTIVE  ra_pace_free
+#else
+#define RA_PACE_ITERATE()    runloop_iterate()
+#define RA_PACE_FREE_ACTIVE  false
+'''
+
+VISION_STEP = r'''#if TARGET_OS_VISION
+   /* 0033: visionOS owns its own tick. Same guards and same -1 exit path as the
+    * iOS branch below; the only additions are pacing telemetry and the
+    * vsync-off free-running mode. */
+
+   /* Never iterate before the frontend exists — see ra_pace_frontend_ready.
+    * This is the whole launch-race fix and it must stay first: everything
+    * below, telemetry included, assumes a live runloop. */
+   if (!ra_pace_frontend_ready)
+      return;
+
+   if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive)
+      return;
+
+   {
+      double   ts   = target.timestamp;
+      double   dur  = target.duration;
+      unsigned flags = runloop_get_flags();
+      settings_t *settings = config_get_ptr();
+      /* Free mode is a GAMEPLAY pacing experiment, so it only applies while a
+       * core is actually running. At the menu (and before rarch_main, when
+       * there are no settings yet) we always use the display-link path with the
+       * observer stopped, so a persisted vsync=false can never affect boot or
+       * make the menu spin. */
+      bool free_mode = settings
+                    && !settings->bools.video_vsync
+                    && (flags & RUNLOOP_FLAG_CORE_RUNNING);
+
+      ra_pace_assert_range(target);
+      ra_pace_announce(target, dur);
+      ra_pace_tick(ts, dur);
+
+      /* vsync ON (or menu/boot): iterate from the time accumulator (r2) —
+       * one frame per elapsed virtual frame period, whatever Hz is granted. */
+      if (!free_mode)
+      {
+         int      ret   = 0;
+         unsigned due   = ra_pace_due(ts, dur);
+         unsigned i;
+         double   spent = 0.0;   /* ms of iterate() in this callback */
+
+         for (i = 0; i < due; i++)
+         {
+            /* A catch-up frame only while this callback has used under half
+             * of its interval; whatever is left stays owed (capped). */
+            if (i > 0 && spent > ra_pace_tick_dt * 500.0)
+            {
+               ra_pace_owe();
+               break;
+            }
+            ret    = RA_PACE_ITERATE();
+            spent += ra_pace_last_ms;
+            ra_pace_runs++;
+            if (i > 0)
+               ra_pace_catchups++;
+            if (ret == -1)
+               break;
+         }
+
+         task_queue_check();
+
+         if (ret == -1)
+         {
+            main_exit(NULL);
+            exit(0);
+            return;
+         }
+      }
+
+      /* Exactly one iteration source at a time:
+       * observer active <=> (free mode || fast-forward). */
+      if (free_mode)
+         ra_pace_due_ts = 0.0;   /* re-entering dl mode starts a fresh clock */
+
+      if (free_mode || (flags & RUNLOOP_FLAG_FASTMOTION))
+      {
+         ra_pace_free = free_mode;
+         rarch_start_draw_observer();
+         CFRunLoopWakeUp(CFRunLoopGetMain());
+      }
+      else
+      {
+         ra_pace_free = false;
+         rarch_stop_draw_observer();
+      }
+
+      ra_pace_report(ts);
+   }
+   return;
+#endif
+'''
+
+REFRESH_VISION = r"""#if TARGET_OS_VISION
+   /* 0033 r2: the display link now asks for every vsync (up to 120 Hz), so
+    * its preferred rate is the panel's, not the content's. Report the virtual
+    * display rate the frontend paces frames to (video_refresh_rate) — what r1
+    * effectively returned, since dispserv had set the link to exactly that. */
+   {
+      settings_t *settings = config_get_ptr();
+      float       hz       = settings ? settings->floats.video_refresh_rate : 60.0f;
+      return (hz >= 10.0f && hz <= 250.0f) ? hz : 60.0f;
+   }
+#endif
+"""
+
+text = SRC.read_text()
+if "0033:" in text or "ra_pace_" in text:
+    sys.exit("0033 already applied to vendor - reverse it out (patch -p1 -R) before regenerating")
+
+EDITS = [
+    # 1. the pacing block, after the CocoaView() class extension
+    (">\n@end\n#endif\n\nstatic CFRunLoopObserverRef iterate_observer;\n",
+     ">\n@end\n" + BLOCK + "#endif\n\nstatic CFRunLoopObserverRef iterate_observer;\n"),
+    # 2. the observer iterates through the timed wrapper
+    ("    CFRunLoopActivity activity, void *info)\n{\n   int ret = runloop_iterate();\n",
+     "    CFRunLoopActivity activity, void *info)\n{\n   int ret = RA_PACE_ITERATE();\n"),
+    # 3. the observer stays armed while the free-running loop owns iteration
+    ("#if !TARGET_OS_TV && !defined(OSX)\n   if (runloop_get_flags() & RUNLOOP_FLAG_FASTMOTION)\n#endif\n      CFRunLoopWakeUp(CFRunLoopGetMain());\n",
+     "#if !TARGET_OS_TV && !defined(OSX)\n   if ((runloop_get_flags() & RUNLOOP_FLAG_FASTMOTION) || RA_PACE_FREE_ACTIVE)\n#endif\n      CFRunLoopWakeUp(CFRunLoopGetMain());\n"),
+    # 4. visionOS owns its own display-link tick
+    ("-(void)step:(CADisplayLink*)target API_AVAILABLE(macos(14.0), ios(3.1), tvos(3.1))\n{\n#if defined(IOS)\n",
+     "-(void)step:(CADisplayLink*)target API_AVAILABLE(macos(14.0), ios(3.1), tvos(3.1))\n{\n" + VISION_STEP + "#if defined(IOS)\n"),
+    # 5. cocoa_get_refresh_rate reports the virtual rate on visionOS
+    ("#else /* iOS / tvOS */\n   CADisplayLink *dl = [CocoaView get].displayLink;\n",
+     "#else /* iOS / tvOS */\n" + REFRESH_VISION + "   CADisplayLink *dl = [CocoaView get].displayLink;\n"),
+]
+new = text
+for i, (a, b) in enumerate(EDITS, 1):
+    n = new.count(a)
+    if n != 1:
+        sys.exit(f"edit {i}: anchor matched {n} times (want 1)")
+    new = new.replace(a, b)
+
+diff = difflib.unified_diff(text.splitlines(keepends=True), new.splitlines(keepends=True),
+                            fromfile="a/" + REL, tofile="b/" + REL, n=3)
+OUT.write_text(f"diff --git a/{REL} b/{REL}\n" + "".join(diff))
+print(f"wrote {OUT}")
+subprocess.run(["patch", "-p1", "--dry-run", "--fuzz=0", "-d", str(ROOT / "vendor/RetroArch"),
+                "-i", str(OUT)], check=True)
+print("dry-run OK")

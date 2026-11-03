@@ -1,0 +1,123 @@
+diff --git a/cores/mupen64plus-next/libretro/libretro_core_options.h b/cores/mupen64plus-next/libretro/libretro_core_options.h
+index fb39aa9..2539ff1 100644
+--- a/cores/mupen64plus-next/libretro/libretro_core_options.h
++++ b/cores/mupen64plus-next/libretro/libretro_core_options.h
+@@ -78,10 +78,23 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+ #ifdef HAVE_PARALLEL_RDP
+             {"parallel", "ParaLLEl-RDP"},
+ #endif
++            /* GLideN64 renders on xros via ANGLE (GLES3-over-Metal) — was
++             * hidden while xros had no GL driver; re-enabled now that ANGLE ships,
++             * so users can pick the GLideN64 path (HLE RSP + universal widescreen). */
+             {"gliden64", "GLideN64"},
+             { NULL, NULL },
+         },
++        /* visionOS: default the GPU-accurate ParaLLEl-RDP (Vulkan/MoltenVK) so N64
++         * renders fast with zero config (device-verified working). Falls back to
++         * angrylion (software) then gliden64. MUPEN_VK_DEFAULT/MUPEN_SW_DEFAULT are
++         * set only for the xros slice; iOS keeps gliden64.. */
++#if defined(MUPEN_VK_DEFAULT) && defined(HAVE_PARALLEL_RDP)
++        "parallel"
++#elif defined(MUPEN_SW_DEFAULT) && defined(HAVE_THR_AL)
++        "angrylion"
++#else
+         "gliden64"
++#endif
+     },
+     {
+         CORE_NAME "-43screensize",
+@@ -172,7 +185,19 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+             {"8", "8x"},
+             { NULL, NULL },
+         },
++#if defined(MUPEN_VK_DEFAULT)
++        /* xros: GLideN64 over ANGLE. Factor 0 ("Disabled") means "render at the
++         * full window", i.e. the 3840x2160 drawable — 8.3 MP through every
++         * combiner, which is the July slowdown. 3 is 960x720 internal,
++         * upscaled to 4K by RetroArch's final blit: sharp, and affordable on the
++         * CPU-bound N64 path. Users can pick 4x/5x per game. Was previously
++         * FORCED via -DMUPEN_NATIVERES_FACTOR (overlay 0029); that force is gone
++         * so the option works again — a persisted 0 will override this default,
++         * hence the OTA note telling the tester to set it by hand once. */
++        "3"
++#else
+         "0"
++#endif
+     },
+     {
+         CORE_NAME "-ThreadedRenderer",
+@@ -186,7 +211,17 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+             {"False", "Disabled"},
+             { NULL, NULL },
+         },
++#if defined(MUPEN_VK_DEFAULT)
++        /* xros: was "True" (+22-42% in the macOS ANGLE harness) up.
++         * Flipped to False for .16 — GLideN64's ThreadedOpenGl layer has never
++         * been exercised against ANGLE on device and is the prime suspect for
++         * both the garbage bars and the worker-thread TLS crash.
++         * A persisted value would win over this default, so overlay 0043 also
++         * FORCES it off at the read site on xros. */
+         "False"
++#else
++        "False"
++#endif
+     },
+     {
+         CORE_NAME "-BilinearMode",
+@@ -568,7 +603,15 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+             {"Enabled", NULL},
+             { NULL, NULL },
+         },
++#if defined(MUPEN_VK_DEFAULT)
++        /* xros: overscan cropping presents through OverscanBuffer, whose offsets
++         * are captured once at _initData while its scale refreshes per frame —
++         * a stale-border suspect for the reported bars. Overlay 0043 also forces
++         * it off at the read site, since the device has a persisted value. */
++        "Disabled"
++#else
+         "Enabled"
++#endif
+     },
+     {
+         CORE_NAME "-OverscanTop",
+@@ -1035,6 +1078,12 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+             { "False", "Disabled" },
+             { NULL, NULL },
+         }
++#if defined(MUPEN_VK_DEFAULT)
++        /* xros Tier 0: default async RDP. N64 is CPU-bound here (interp,
++         * no JIT), so don't stall the CPU waiting on RDP completion. Cost: rare
++         * per-game CPU-framebuffer-readback artifacts (re-enable per game if seen). */
++        , "False"
++#endif
+     },
+     {
+         CORE_NAME "-parallel-rdp-overscan",
+@@ -1163,6 +1212,13 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+             { "8x", NULL },
+             { NULL, NULL },
+         }
++#if defined(MUPEN_VK_DEFAULT)
++        /* xros: default 4x (1280x960 internal) — the 4K display makes 1x/2x look
++         * soft, and parallel-rdp upscaling is GPU-side (M5), so it costs the
++         * CPU-bound N64 ~nothing measurable.
++         * Users can go 8x or drop to 1x/2x per game.. */
++        , "4x"
++#endif
+     },
+     {
+         CORE_NAME "-parallel-rdp-super-sampled-read-back",
+@@ -1410,7 +1466,13 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+             {"hle", "HLE"},
+             { NULL, NULL },
+         },
++        /* Pair the software RDP with the LLE interpreter RSP on xros (parallel
++         * RSP is JIT-only, dead without a debugger). See MUPEN_SW_DEFAULT above. */
++#if defined(MUPEN_SW_DEFAULT) && defined(HAVE_LLE)
++        "cxd4"
++#else
+         "hle"
++#endif
+     },
+     {
+         CORE_NAME "-FrameDuping",

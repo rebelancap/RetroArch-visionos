@@ -1,0 +1,19 @@
+diff --git a/gfx/common/vulkan_common.c b/gfx/common/vulkan_common.c
+index d595c59..c3e40ae 100644
+--- a/gfx/common/vulkan_common.c
++++ b/gfx/common/vulkan_common.c
+@@ -2640,6 +2640,14 @@ bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
+          int use_mab                      = settings->bools.video_use_metal_arg_buffers;
+          setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", use_mab ? "1" : "0", 1);
+       }
++#if defined(RA_VISIONOS)
++      /* overlay 0021 (Q3): compile pipeline variants across cores concurrently so
++       * parallel-rdp's first-encounter-per-scene SPIRV->MSL stalls shrink (the
++       * ~4-5s black between N64 scenes). MoltenVK 1.2.7+; we bundle 1.4.1.
++       * (Persistent pipeline cache is the deeper fix.) */
++      if (!getenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION"))
++         setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 1);
++#endif
+       /* Try Vulkan loader first (enables validation layers if installed).
+        * Falls back to MoltenVK directly if loader not available. */
+       vulkan_library = dylib_load("libvulkan.dylib");

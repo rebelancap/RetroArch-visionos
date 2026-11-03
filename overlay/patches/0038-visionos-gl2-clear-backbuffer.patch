@@ -1,0 +1,39 @@
+diff --git a/gfx/drivers/gl2.c b/gfx/drivers/gl2.c
+--- a/gfx/drivers/gl2.c
++++ b/gfx/drivers/gl2.c
+@@ -3751,6 +3751,35 @@
+       SET_TEXTURE_COORDS(feedback_info.coord, xamt, yamt);
+    }
+ 
++#if defined(RA_VISIONOS)
++   /* 0038: guarantee BLACK letterbox bars, not garbage.
++    *
++    * The tester sees rainbow noise in the bars when SM64 is letterboxed on the
++    * ANGLE path. Rainbow = drawable regions nobody wrote: the clear just below
++    * honours the scissor box, so whatever gl2_set_viewport left scissored
++    * shields the bars from it, and each frame gets a fresh, uninitialised
++    * swapchain texture underneath. Whatever ends up being the root cause of the
++    * letterbox itself (see the "angle vp" beacon in cocoa_angle_ctx.m), the
++    * bars should be black meanwhile.
++    *
++    * Only fires when the computed viewport does NOT cover the drawable, so the
++    * ordinary full-frame case is untouched and there is no double clear there.
++    * Scissor is saved and restored so no other state changes. */
++   if (   gl->vp.x > 0
++       || gl->vp.y > 0
++       || gl->vp.width  < gl->vp.full_width
++       || gl->vp.height < gl->vp.full_height)
++   {
++      GLboolean scissor_on = glIsEnabled(GL_SCISSOR_TEST);
++      if (scissor_on)
++         glDisable(GL_SCISSOR_TEST);
++      glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++      glClear(GL_COLOR_BUFFER_BIT);
++      if (scissor_on)
++         glEnable(GL_SCISSOR_TEST);
++   }
++#endif
++
+    glClear(GL_COLOR_BUFFER_BIT);
+ 
+    params.vp_width         = gl->out_vp_width;

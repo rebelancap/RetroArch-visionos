@@ -1,0 +1,15 @@
+diff --git a/cores/mupen64plus-next/GLideN64/src/DisplayWindow.cpp b/cores/mupen64plus-next/GLideN64/src/DisplayWindow.cpp
+--- a/cores/mupen64plus-next/GLideN64/src/DisplayWindow.cpp
++++ b/cores/mupen64plus-next/GLideN64/src/DisplayWindow.cpp
+@@ -157,5 +157,11 @@
+ void DisplayWindow::_setBufferSize()
+ {
+ 	m_bAdjustScreen = false;
++	/* 0047: reset the adjust factor with the flag it belongs to. Upstream only
++	 * ever assigns m_adjustScale inside the two adjust branches, so a session
++	 * that has been in "adjusted" mode keeps 0.75 forever — and gSPClipVertex()
++	 * applies it to the clip test with no isAdjustScreen() check, silently
++	 * widening the clip volume in stretch/4:3 modes. lead (c). */
++	m_adjustScale = 1.0f;
+ 	switch (config.frameBufferEmulation.aspect) {
+ 	case Config::aStretch: // stretch

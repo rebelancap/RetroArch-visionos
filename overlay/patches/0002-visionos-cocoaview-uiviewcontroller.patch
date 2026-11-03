@@ -1,0 +1,13 @@
+diff --git a/ui/drivers/cocoa/cocoa_common.h b/ui/drivers/cocoa/cocoa_common.h
+index 4a9ed2f..677cec6 100644
+--- a/ui/drivers/cocoa/cocoa_common.h
++++ b/ui/drivers/cocoa/cocoa_common.h
+@@ -76,7 +76,7 @@
+ @class EmulatorTouchMouseHandler;
+ #endif
+ 
+-#if TARGET_OS_IOS
++#if TARGET_OS_IOS || TARGET_OS_VISION
+ @interface CocoaView : UIViewController
+ 
+ #elif TARGET_OS_TV
